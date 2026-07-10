@@ -1,0 +1,49 @@
+# Updated MoCha2026 Phase-wise Implementation Plan
+
+This document outlines the revised step-by-step technical plan to build a robust model for MoCha2026, leveraging the new `CARE-PD` repository's State-of-the-Art (SOTA) Transformer models. We remain strictly bound by the Ryzen 3 Dual-Core CPU / 8GB RAM hardware constraints.
+
+## User Review Required
+> [!IMPORTANT]
+> The new repository provides pre-trained checkpoints for heavy Transformer models (e.g., MotionBERT, MoMask). We cannot train these locally on a Ryzen 3. Instead, we will use them purely in `eval()` mode as **Offline Feature Extractors**. We will then train a LightGBM model on these rich features. Please approve this dual-track extraction strategy before we proceed.
+
+## Open Questions
+- Downloading the pre-trained checkpoints requires running a script that downloads ~1GB of weights via `gdown`. Are you comfortable with this storage usage, and do you want me to execute the download script in Phase 1?
+
+## Proposed Changes
+
+We will tackle this competition in five distinct phases.
+
+### Phase 1: Environment Setup & Pre-Trained Weights
+- **Action:** Install dependencies (`lightgbm`, `scikit-learn`, `optuna`).
+- **Action:** Execute `CARE-PD_github/scripts/download_models.sh` to acquire the SOTA checkpoints.
+- **Goal:** Ensure all backbone models are ready for inference on the CPU.
+
+### Phase 2: Dual-Track Offline Feature Extraction
+- **Action:** Write `extract_features.py`.
+- **Method:** We will run two tracks over `CARE-PD/Canonicalized_SMPL_pickles`:
+  - **Track A:** Extract 512D features using the original baseline BiGRU model.
+  - **Track B:** Extract advanced embeddings using a SOTA Transformer (e.g., `MoMask` or `MotionCLIP`) loaded via `CARE-PD_github/model/backbone_loader.py`.
+- **Output:** `train_features_baseline.csv` and `train_features_sota.csv`.
+- **Memory Check:** Both loops process one `.pkl` at a time and force garbage collection `gc.collect()` to remain well under the 8GB RAM limit.
+
+### Phase 3: LightGBM / XGBoost Model Training
+- **Action:** Write `train_lgbm.py`.
+- **Method:** We will train LightGBM classifiers on both datasets to compare performance.
+- **Evaluation:** Implement 5-fold cross-validation locally, optimizing hyperparameters via `Optuna` to maximize **Macro F1** and **Quadratic Weighted Kappa (QWK)**. We will use SMOTE or class weights to handle the ordinal target imbalance.
+- **Goal:** Select the absolute best combination of Feature Extractor + LightGBM to exceed the `0.70` target.
+
+### Phase 4: Constructing the Final Submission Zip
+- **Action:** Modify the baseline's `submission/baseline_model.py` and `run.py`.
+- **Method:** 
+  1. The API wrapper `predict(data)` will instantiate the winning PyTorch feature extractor (BiGRU or SOTA).
+  2. The extracted features are passed into our optimized `LightGBM` model (`model.joblib`).
+  3. The integer prediction is returned.
+- **Package:** Write a script to zip only the required `run.py`, the LightGBM weights, and the *single* winning PyTorch checkpoint, ensuring we stay under CodaBench upload limits.
+
+### Phase 5: Submission and Iteration
+- **Action:** Upload the zipped model to the CodaBench server.
+- **Goal:** Validate if our >0.70 local Cross-Validation score translates to the hidden benchmark dataset.
+
+## Verification Plan
+1. **Memory Profile:** When extracting SOTA features on CPU, I will actively monitor memory to prevent OOM crashes on the 8GB RAM.
+2. **Local Leaderboard:** We will construct a local CV suite that directly outputs `Macro F1` and `QWK`, giving us 100% confidence before submitting.

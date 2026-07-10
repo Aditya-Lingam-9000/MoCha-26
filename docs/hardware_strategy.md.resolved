@@ -1,0 +1,24 @@
+# Hardware Strategy (Low-End CPU, 8GB RAM Constraints)
+
+Given the hardware constraints (Ryzen 3 dual-core, 8GB RAM, and no discrete GPU), running a traditional deep learning pipeline—especially on variable-length SMPL video features—is not feasible in-memory. We must adapt our workflow carefully to avoid Out of Memory (OOM) errors and extremely long training times.
+
+## 1. Feature Pre-Extraction (Offline Step)
+The baseline uses an `EvaluatorModelWrapper` to project raw SMPL coordinates and betas into a 512-dimensional embedding per walk. We will **extract these 512D vectors once for the entire training set and save them to disk (e.g., as `.npy` or `.csv` files)**.
+- **Benefit:** Instead of holding thousands of SMPL sequences in RAM (which would easily exceed 8GB), we only hold tabular data of `[N_samples, 512]` features, which takes mere megabytes.
+- **Process:** We will write a lightweight script that iterates over `Canonicalized_SMPL_pickles`, runs the pre-trained feature extractor on CPU for one sequence at a time, and appends the resulting 512D vector to an array.
+
+## 2. Lightweight Model Architecture
+Since deep MLPs are slow to train on CPUs and often prone to overfitting on small datasets, we will completely replace the Deep Learning classifier with a robust CPU-friendly algorithm.
+- **Primary Candidates:** 
+  - **LightGBM** or **XGBoost:** Highly optimized gradient boosting frameworks that are extremely fast on dual-core CPUs and handle tabular data perfectly.
+  - **Random Forest:** Very parallelizable across CPU cores and extremely fast to train.
+  - **Ordinal Regression Variants:** Since UPDRS scores are ordinal (0 to 3), we can use classifiers designed to minimize QWK (Quadratic Weighted Kappa).
+- **Benefit:** Training a LightGBM model on CPU with a few thousand samples of dimension 512 takes literally **seconds**, allowing us to run rapid hyperparameter tuning (GridSearchCV / Optuna).
+
+## 3. Dealing with Low Memory During Cross-Validation
+- **Batch Processing:** During the initial feature extraction, we process one `pkl` file at a time, run garbage collection (`gc.collect()`), and ensure we do not retain large arrays in memory.
+- **No Heavy Parallelism:** We will limit multi-processing `n_jobs` to 1 or 2, aligning with the Ryzen 3's dual-core capability to prevent CPU thrashing and memory exhaustion.
+
+## 4. Evaluation Constraints
+- Since submission evaluation happens in an offline Docker container (where we have no internet and no GPU), deploying a Tree-Based Model (e.g., via `joblib` or `scikit-learn` or `lightgbm`) is perfectly robust.
+- The `predict()` function will simply extract the 512D feature using the frozen EvaluatorModelWrapper (which runs efficiently on CPU during inference), and then run `.predict()` on the trained LightGBM model.

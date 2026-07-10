@@ -1,0 +1,39 @@
+# MoCha2026: Benchmark and Challenge on Parkinsonian Gait
+
+## 1. Challenge Summary
+The MoCha2026 challenge focuses on evaluating machine learning methods for predicting Parkinsonian gait severity from 3D human motion sequences. The task is to predict the MDS-UPDRS (Movement Disorder Society-Sponsored Revision of the Unified Parkinson's Disease Rating Scale) gait severity class.
+
+**Key Objective:**  
+Improve the final evaluation score (Macro F1) from the provided baseline of **0.43** to at least **0.70**.
+
+## 2. Input Data
+Participants use the **CARE-PD** dataset (Clinical Archive of REcordings for Parkinson's Disease).
+- **Format:** Python pickles containing canonicalized SMPL (Skinned Multi-Person Linear) body model parameters.
+- **Fields per sample:**
+  - `pose`: `np.ndarray` of shape `(T, 72)` representing SMPL axis-angle poses.
+  - `trans`: `np.ndarray` of shape `(T, 3)` representing global translation.
+  - `beta`: `np.ndarray` of shape `(1, 10)` set to zeros for privacy.
+  - `fps`: `int` original collection frame rate.
+
+**Coordinate System:** `x = lateral`, `y = up`, `z = forward`.  
+
+## 3. Labels and Metrics
+**Labels:**
+The label is the MDS-UPDRS severity class, which is ordinal:
+- `0`: Normal
+- `1`: Slight
+- `2`: Mild
+- `3`: Moderate/Severe
+
+**Evaluation Metrics:**
+1. **Macro F1 (Primary Leaderboard Metric):** Aims to ensure that performance is good across all classes regardless of their frequency.
+2. **Quadratic Weighted Kappa (QWK):** An ordinal-aware metric penalizing predictions that are farther from the ground truth.
+3. **Macro Precision, Macro Recall, Accuracy:** Supplementary metrics.
+
+## 4. Evaluation and Submission
+- **Environment:** CodaBench with an isolated Docker container.
+- **Constraints:** Max 3 submissions per day. Code runs offline on hidden test data.
+- **Format:** A zip file containing `run.py`, `metadata.yaml`, model weights, and any necessary source code. No internet access or dynamic package installation is allowed during evaluation.
+
+## 5. Current Top Leaderboard
+Top competitors have achieved scores around **0.65**. The target is **0.70**.
