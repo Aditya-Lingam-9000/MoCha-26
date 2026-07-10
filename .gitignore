@@ -22,13 +22,13 @@ wheels/
 *.egg
 
 # Data and Checkpoints
-*.csv
-*.pth
-*.pt
-*.npy
-*.joblib
-*.tar
-submission.zip
+/*.csv
+/*.pth
+/*.pt
+/*.npy
+/*.joblib
+/*.tar
+/submission.zip
 
 # Ignore massive dataset and weights folders to prevent GitHub rejection (100MB limit)
 CARE-PD/
