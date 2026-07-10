@@ -1,0 +1,498 @@
+<h1 align="center">CARE-PD: A Multi-Site Anonymized Clinical Dataset for Parkinson’s Disease Gait Assessment
+<br>
+<strong>(NeurIPS 2025)
+</h1>
+<p align="center">
+        <a href="https://arxiv.org/abs/2510.04312"><img src='https://img.shields.io/badge/CAREPD-arXiv-B31B1B.svg' alt='Paper PDF'></a>
+        <a href="https://neurips2025.care-pd.ca/"><img src='https://img.shields.io/badge/CAREPD-Project_Page-green.svg' alt='Project Page'></a>
+        <a href="https://huggingface.co/datasets/vida-adl/CARE-PD"><img src='https://img.shields.io/badge/CAREPD-HuggingFace_Model-yellow'></a>
+        <a href="https://borealisdata.ca/dataset.xhtml?persistentId=doi:10.5683/SP3/TWIKMK"><img src='https://img.shields.io/badge/CAREPD-Dataverse-purple'></a>
+    <br>
+</p>
+
+# CARE-PD
+CARE-PD is a dataset and evaluation benchmark suite for clinical gait analysis in Parkinson’s Disease, released as part of NeurIPS 2025 Datasets & Benchmarks Track submission.
+
+![CARE-PD Pipeline](docs/diagram.png)
+
+## Overview
+
+CARE-PD is the largest publicly available archive of 3D mesh gait data for Parkinson's Disease (PD) and the first to include data collected across multiple sites. The dataset aggregates 9 cohorts from 8 clinical sites, including 363 participants spanning a range of disease severity. All recordings—whether from RGB video or motion capture—are unified into anonymized SMPL body gait meshes through a curated harmonization pipeline.
+
+This dataset enables two main benchmarks:
+1. **Supervised clinical score prediction**: Estimating UPDRS gait scores from 3D meshes
+2. **Unsupervised motion pretext tasks**: Parkinsonian gait representation learning
+
+# ⚙️ Get You Ready
+<details>
+
+```
+git clone https://github.com/TaatiTeam/CARE-PD.git
+cd CARE-PD
+```
+### 1️⃣ Install Dependencies
+
+<!-- #### 🔹 Option 1: Install Using Conda (Recommended)
+```
+conda env create -n archgait -f environment.yml
+conda activate archgait
+``` -->
+
+We tested our code on Python 3.9.21 and PyTorch 2.6.0
+
+#### 🔹 Install Using Pip
+```
+python -m venv carepd
+source carepd/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+```
+
+
+### 2️⃣ Datasets setup
+```
+mkdir -p assets/datasets
+```
+Download the CARE-PD datasets from Dataverse and put them in the `assets/datasets` folder. Optionally you can download from HuggingFace:
+```
+huggingface-cli download vida-adl/CARE-PD --repo-type dataset --local-dir ./assets/datasets
+```
+You can use smpl_reader to read files and get a summary stats:
+```
+python data/smpl_reader.py --dataset PD-GaM BMCLab 3DGait T-SDU-PD DNE E-LC KUL-DT-T T-LTC T-SDU
+```
+
+#### Preprocess Data
+##### 🔹 h36m formats
+<details>
+
+Download preprocessed h36m formats from Dataverse  and put them in the `assets/datasets` folder.
+Rename the folder:
+```
+mv assets/datasets/h36m_preprocessed assets/datasets/h36m
+```
+You can also preprocess all datasets with the following command but it might take quite some time:
+```
+bash scripts/preprocess_smpl2h36m.sh
+```
+
+</details>
+
+##### 🔹 HumanML3D formats
+<details>
+
+Download preprocessed HumanML3D formats from Dataverse  and put them in the `assets/datasets` folder.
+Rename the folder:
+```
+mv assets/datasets/HumanML3D_preprocessed assets/datasets/HumanML3D
+```
+You can also preprocess all datasets with the following command but it might take quite some time:
+```
+bash scripts/preprocess_smpl2humanml3d.sh
+```
+</details>
+
+##### 🔹 6D rotation formats
+<details>
+
+Download preprocessed 6D rotation formats from Dataverse  and put them in the `assets/datasets` folder.
+Rename the folder:
+```
+mv assets/datasets/6D_preprocessed assets/datasets/6D_SMPL
+```
+You can also preprocess all datasets with the following command but it might take quite some time:
+```
+bash scripts/preprocess_smpl2sixD.sh
+```
+
+</details>
+
+Please also check [dataset.md](docs/dataset.md) for more information. The dataset directory structure should look:
+```
+assets/
+└── datasets/
+    └── 6D_SMPL/
+        ├── 3DGait/
+        ├── ...
+    ├── folds/ 
+        ├── Other_Datasets/
+        ├── UPDRS_Datasets/
+    ├── h36m/ 
+        ├── 3DGait/
+        ├── ...
+    ├── HumanML3D/ 
+        ├── 3DGait/
+        ├── ...
+    ├── 3DGait.pkl 
+    ├── BMCLab.pkl
+    ├── DNE.pkl 
+    ├── E-LC.pkl 
+    ├── KUL-DT-T.pkl 
+    ├── PD-GaM.pkl 
+    ├── T-LTC.pkl 
+    ├── T-SDU-PD.pkl 
+    ├── T-SDU.pkl 
+```
+
+
+### 3️⃣ Models and Dependencies
+
+#### Download Pre-trained Models
+```
+bash scripts/download_models.sh
+```
+Pretrained checkpoints will be downloaded in `assets/Pretrained_checkpoints`
+
+
+</details>
+
+
+
+
+# 🚀 Running code
+
+The output for each experiment will be saved inside a folder in `experiment_outs/**experiment_name**` specified in the config json file. To see full list for configs please check the config generator for each model inside `./configs` folder.
+
+### 🔍 Hyperparameter Tuning
+
+<details>
+
+You can run hyperparameter tuning on the **BMCLab** dataset across all backbone models using:
+
+```
+bash scripts/hypertune_all_models.sh
+```
+
+You can also run a single tuning job manually like this:
+
+```
+python eval_encoder_hypertune.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 1 \
+  --tune_fresh 1 \
+  --this_run_num 0 \
+  --ntrials 50
+```
+
+#### 🧪 Tune Epochs on Other Datasets
+After hypertuning on BMCLab, you can tune only the number of epochs for each remaining dataset using:
+
+```
+bash scripts/hypertune_epochs_all_datasets.sh
+```
+
+You can also run a single dataset tuning job like:
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 1 \
+  --tune_fresh 1 \
+  --ntrials 5 \
+  --this_run_num 0
+```
+</details>
+
+### 📊 Train and Evaluation
+
+<details>
+
+### 🧪 Within-Dataset Evaluation (LOSO)
+<details>
+
+You can run final Within-Dataset evaluation on each dataset using:
+
+```
+bash scripts/eval_within_dataset.sh
+```
+This script:
+
+ - Loads the best hyperparameters from each study
+ - Retrains the model from scratch on the full training folds
+ - Evaluates performance in a LOSO setup
+ - Automatically combines predictions from back and side views (for multi-view models)
+ - Logs results and confusion matrices to `reports/intra_eval/`
+
+You can also run a single dataset evaluation using:
+
+##### 🔹 For single-view (3D) models:
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 0 \
+  --cross_dataset_test 0 \
+  --this_run_num 0 \
+  --num_folds -1
+```
+MODELNAME in (potr, momask, motionclip).
+
+##### 🔹 For two-view 2D-to-3D models (combined views):
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --hypertune 0 \
+  --cross_dataset_test 0 \
+  --this_run_num 0 \
+  --num_folds -1 \
+  --combine_views_preds 1 \
+  --views_path \
+    "Hypertune/MODELNAME_CONFIGNAME_backright/0" \
+    "Hypertune/MODELNAME_CONFIGNAME_sideright/0"
+```
+MODELNAME in (motionbert, mixste, poseformerv2, motionagformer).
+
+--------
+To run using predefined best configs you can pass directly the best model configs:
+```
+python eval_only.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 0 \
+  --num_folds -1 \
+  "--tuned_config", "./configs/best_configs_augmented/....json"
+```
+
+</details>
+
+### 🌍 Cross-Dataset Evaluation
+<details>
+
+After within-dataset testing, you can evaluate how well each model generalizes across datasets.
+
+To run all cross-dataset experiments:
+
+```
+bash scripts/eval_cross_dataset.sh
+```
+
+This script:
+
+  - Loads the best hyperparameters from each model's tuning run
+  - Trains each model on its original dataset
+  - Tests on all other datasets (automatically handled in code)
+  - Combines predictions from multiple views for multi-view models
+  - Logs all outputs to `reports/cross_eval/`
+
+
+
+To evaluate on a single model and dataset use:
+
+##### 🔹 For single-view (3D) models:
+```
+python run.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 0 \
+  --cross_dataset_test 1 \
+  --this_run_num 0
+```
+MODELNAME in (potr, momask, motionclip).
+
+##### 🔹 For two-view 2D-to-3D models (combined views):
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --hypertune 0 \
+  --cross_dataset_test 1 \
+  --combine_views_preds 1 \
+  --views_path \
+    "Hypertune/MODELNAME_CONFIGNAME_backright/0" \
+    "Hypertune/MODELNAME_CONFIGNAME_sideright/0"
+```
+MODELNAME in (motionbert, mixste, poseformerv2, motionagformer).
+
+--------
+To run using predefined best configs you can pass directly the best model configs:
+```
+python eval_only.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 0 \
+  --cross_dataset_test 1\
+  "--tuned_config", "./configs/best_configs_augmented/....json"
+```
+
+</details>
+
+### 🌐 Leave One Dataset Out Evaluation (LODO)
+
+<details>
+
+#### 🔁 LODO Epoch Tuning
+For Leave-One-Dataset-Out (LODO) evaluation, we first tune the number of training epochs on each dataset **excluding** the target dataset (i.e., LODO setup).
+
+To run all epoch-tuning jobs for LODO:
+
+```
+bash scripts/hypertune_lodo_epochs.sh
+```
+This script:
+  - Tunes the number of epochs per dataset used in LODO training
+  - Forces LODO=True using --force_LODO 1
+  - Uses --exp_name_rigid LODO to name all output folders consistently
+  - Logs all runs to `reports/hypertune_lodo/`
+
+To evaluate on a single model and dataset use:
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --ntrials 5 \
+  --this_run_num 0 \
+  --hypertune 1 \
+  --tune_fresh 1 \
+  --force_LODO 1 \
+  --exp_name_rigid LODO
+```
+MODELNAME in (potr, momask, motionclip, motionbert, mixste, poseformerv2, motionagformer).
+
+#### 📊 LODO Evaluation
+
+In this step, we evaluate how well each model generalizes **across datasets** when trained using a **Leave-One-Dataset-Out (LODO)** strategy.
+
+Each model is:
+  - Trained on all datasets **except** the target
+  - Evaluated only on the left-out dataset
+
+To run all LODO evaluation jobs:
+
+```
+bash scripts/eval_lodo.sh
+```
+All logs are saved in: `reports/lodo_eval/`
+To evaluate on a single model and dataset use:
+
+##### 🔹 For single-view (3D) models:
+```
+python run.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --this_run_num 0 \
+  --hypertune 0 \
+  --cross_dataset_test 1 \
+  --force_LODO 1 \
+  --exp_name_rigid LODO
+```
+MODELNAME in (potr, momask, motionclip).
+
+##### 🔹 For two-view 2D-to-3D models (combined views):
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --hypertune 0 \
+  --cross_dataset_test 1 \
+  --force_LODO 1 \
+  --exp_name_rigid LODO \
+  --combine_views_preds 1 \
+  --views_path \
+    "LODO/MODELNAME_CONFIGNAME_backright_LODO/0" \
+    "LODO/MODELNAME_CONFIGNAME_sideright_LODO/0"
+```
+MODELNAME in (motionbert, mixste, poseformerv2, motionagformer).
+
+--------
+To run using predefined best configs you can pass directly the best model configs:
+```
+python eval_only.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --hypertune 0 \
+  --cross_dataset_test 1\
+  --force_LODO 1 \
+  "--tuned_config", "./configs/best_configs_augmented/LODO/....json"
+```
+
+</details>
+
+### 🧬 MIDA Evaluation
+<details>
+
+The final evaluation step uses **Multi-dataset In-domain Adaptation** training under a **LOSO** setup.
+
+Each model is:
+
+- Trained on all datasets, plus the **training portion** of the in domain dataset
+- Evaluated on the **test portion only**
+- Configured with `--AID 1`, `--force_LODO 1`, and `--num_folds -1` to reflect this setup
+
+To run all MIDA evaluations:
+
+```
+bash scripts/eval_mida.sh
+```
+
+All logs are stored under: `reports/mida_eval`
+To evaluate on a single model and dataset use:
+
+##### 🔹 For single-view (3D) models:
+```
+python run.py \
+  --backbone MODELNAME \
+  --config CONFIGNAME.json \
+  --this_run_num 0 \
+  --hypertune 0 \
+  --cross_dataset_test 1 \
+  --force_LODO 1 \
+  --AID 1 \
+  --num_folds -1 \
+  --exp_name_rigid LODO
+```
+MODELNAME in (potr, momask, motionclip).
+
+##### 🔹 For two-view 2D-to-3D models (combined views):
+
+```
+python run.py \
+  --backbone MODELNAME \
+  --hypertune 0 \
+  --cross_dataset_test 1 \
+  --force_LODO 1 \
+  --AID 1 \
+  --num_folds -1 \
+  --exp_name_rigid LODO \
+  --combine_views_preds 1 \
+  --views_path \
+    "LODO/MODELNAME_CONFIGNAME_backright_LODO/0" \
+    "LODO/MODELNAME_CONFIGNAME_sideright_LODO/0"
+```
+MODELNAME in (motionbert, mixste, poseformerv2, motionagformer).
+
+
+</details>
+
+</details>
+
+## Acknowledgement
+We sincerely thank all participating research institutions and subjects who made this dataset possible.
+We also thank the open-sourcing of these works where some of our code is based on:
+[HumanML3D](https://github.com/EricGuo5513/HumanML3D), [joints2smpl](https://github.com/wangsen1312/joints2smpl), [MoMask](https://github.com/EricGuo5513/momask-codes), [MotionBert](https://github.com/Walter0807/MotionBERT), [MotionBert](https://github.com/TaatiTeam/MotionAGFormer), [MotionCLIP](https://github.com/GuyTevet/MotionCLIP), [PoserFormerV2](https://github.com/QitaoZhao/PoseFormerV2), [POTR](https://github.com/idiap/potr), [MixSTE](https://github.com/JinluZhang1126/MixSTE)
+
+## Citation
+
+If you use CARE-PD in your research, please cite:
+
+```
+@inproceedings{adeli2025carepd,
+title={CARE-PD: A Multi-Site Anonymized Clinical Dataset for Parkinson’s Disease Gait Assessment},
+author={Vida Adeli, Ivan Klabučar, Javad Rajabi, Benjamin Filtjens, Soroush Mehraban, Diwei Wang, Hyewon Seo, Trung-Hieu Hoang, Minh N. Do, Candice Muller, Claudia Neves de Oliveira, Daniel Boari Coelho, Pieter Ginis, Moran Gilat, Alice Nieuwboer, Joke Spildooren, J. Lucas McKay, Hyeokhyen Kwon, Gari Clifford, Christine D. Esper, Stewart A. Factor, Imari Genias, Amirhossein Dadashzadeh, Leia Shum, Alan Whone, Majid Mirmehdi, Andrea Iaboni, Babak Taati},
+booktitle={NeurIPS},
+year={2025}
+}
+```
+and all applicable original dataset papers when using the corresponding cohorts.
+<p style="font-size: 1em;">
+          <strong>Complete list of citations:</strong> 
+          <a href="https://neurips2025.care-pd.ca/citations.html" style="color: #3273dc; text-decoration: underline;">
+            View all original dataset citations →
+          </a>
+        </p>
+

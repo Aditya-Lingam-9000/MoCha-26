@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local predictions and packaged submissions
+predictions.json
+*_submission.zip
+*.zip
+
+# Keep challenge hidden data out of the public repository
+input_data/
+reference_data/
+local_test_output*/
+submission_results/
