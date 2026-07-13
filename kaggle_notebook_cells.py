@@ -32,43 +32,54 @@ def run_cmd(cmd):
     print(f"Running: {cmd}")
     subprocess.run(cmd, shell=True, check=True)
 
-print("--- 1. Setting up Environment ---")
+print("--- 1. Setting up Environment & Downloading Weights/Datasets ---")
 run_cmd("pip install huggingface_hub pandas scikit-learn lightgbm numpy torch tqdm")
 
 # Define Kaggle paths
-ROOT_DIR = Path("/kaggle/working").resolve()
-BASELINE_DIR = ROOT_DIR / "MoCha_baseline_bundle"
-CAREPD_DIR = ROOT_DIR / "CARE-PD_github" 
-DATASET_DIR = ROOT_DIR / "CARE-PD"
+KAGGLE_WORKING = Path("/kaggle/working").resolve()
+REPO_DIR = KAGGLE_WORKING / "MoCha-26"
+DATASET_DIR = KAGGLE_WORKING / "CARE-PD"
 
-# Download Repos
-if not BASELINE_DIR.exists():
-    run_cmd("git clone https://github.com/TaatiTeam/MoCha_baseline_bundle")
-    run_cmd(f"cd {BASELINE_DIR} && git lfs pull")
+# 1. Clone your main repository
+if not REPO_DIR.exists():
+    run_cmd(f"git clone https://github.com/Aditya-Lingam-9000/MoCha-26.git {REPO_DIR}")
 
-# NOTE: Since CARE-PD_github contains MoMask, we clone it. If the original repo doesn't have the weights, 
-# you should clone your own Github repo instead! For now, we assume you cloned your codebase to CARE-PD_github.
-if not CAREPD_DIR.exists():
-    print("Cloning your codebase containing MoMask assets...")
-    run_cmd("git clone https://github.com/Aditya-Lingam-9000/MoCha-26.git CARE-PD_github")
+# Define paths relative to the cloned repo
+BASELINE_DIR = REPO_DIR / "MoCha_baseline_bundle"
+CAREPD_DIR = REPO_DIR / "CARE-PD_github"
 
+# 2. Download Baseline weights by cloning the original baseline bundle
+TEMP_BASELINE = KAGGLE_WORKING / "temp_baseline"
+if not (BASELINE_DIR / "weights").exists():
+    if not TEMP_BASELINE.exists():
+        run_cmd(f"git clone https://github.com/TaatiTeam/MoCha_baseline_bundle {TEMP_BASELINE}")
+        run_cmd(f"cd {TEMP_BASELINE} && git lfs pull")
+    shutil.copytree(TEMP_BASELINE / "weights", BASELINE_DIR / "weights")
+
+# 3. Download MoMask weights by cloning the original CARE-PD repo
+TEMP_CAREPD = KAGGLE_WORKING / "temp_carepd"
+if not (CAREPD_DIR / "assets").exists():
+    if not TEMP_CAREPD.exists():
+        run_cmd(f"git clone https://github.com/TaatiTeam/CARE-PD.git {TEMP_CAREPD}")
+    shutil.copytree(TEMP_CAREPD / "assets", CAREPD_DIR / "assets")
+
+# 4. Download CARE-PD Dataset Pickles from HuggingFace
 if not DATASET_DIR.exists():
     print("Downloading CARE-PD dataset from HuggingFace...")
-    run_cmd("huggingface-cli download vida-adl/CARE-PD --local-dir CARE-PD --repo-type dataset")
+    run_cmd(f"huggingface-cli download vida-adl/CARE-PD --local-dir {DATASET_DIR} --repo-type dataset")
+
+# Change directory to the repository root so imports work naturally
+os.chdir(str(REPO_DIR))
+sys.path.insert(0, str(REPO_DIR))
+sys.path.insert(0, str(BASELINE_DIR))
+sys.path.insert(0, str(CAREPD_DIR))
 
 print("--- 2. Extracting Features (Supervised & Unsupervised) ---")
-# Import dependencies from the cloned bundles
-sys.path.insert(0, str(BASELINE_DIR))
-sys.modules.pop('model', None)
-import model as baseline_model_module
+# Import dependencies
 from submission.preprocess import MotionPreprocessor
 from utils.get_opt import get_opt as baseline_get_opt
 from model.t2m_eval_wrapper import EvaluatorModelWrapper
 
-sys.path.insert(0, str(CAREPD_DIR))
-sys.modules.pop('model', None)
-sys.modules.pop('utils', None)
-sys.modules.pop('utils.get_opt', None)
 from model.momask.model import RVQVAE
 from model.momask.get_opt import get_opt as momask_get_opt
 
@@ -182,8 +193,8 @@ X_std = X_sup.std(axis=0, keepdims=True) + 1e-8
 X_sup = (X_sup - X_mean) / X_std
 X_unsup = (X_unsup - X_mean) / X_std
 
-np.save(ROOT_DIR / "fusion_scaler_mean.npy", X_mean)
-np.save(ROOT_DIR / "fusion_scaler_std.npy", X_std)
+np.save(REPO_DIR / "fusion_scaler_mean.npy", X_mean)
+np.save(REPO_DIR / "fusion_scaler_std.npy", X_std)
 
 # Train initial model
 print("Training initial PyTorch model on supervised data...")
@@ -235,16 +246,15 @@ for epoch in range(20):
         loss.backward()
         optimizer.step()
         
-torch.save(model_final.state_dict(), ROOT_DIR / "classifier_fusion.pth")
+torch.save(model_final.state_dict(), REPO_DIR / "classifier_fusion.pth")
 print("Saved final domain-adapted model!")
 
 print("--- 4. Packaging Submission ---")
-# The packaging logic dynamically creates the zip on Kaggle
-shutil.copy2(ROOT_DIR / "classifier_fusion.pth", BASELINE_DIR / "weights" / "classifier_fusion.pth")
-shutil.copy2(ROOT_DIR / "fusion_scaler_mean.npy", BASELINE_DIR / "weights" / "fusion_scaler_mean.npy")
-shutil.copy2(ROOT_DIR / "fusion_scaler_std.npy", BASELINE_DIR / "weights" / "fusion_scaler_std.npy")
+shutil.copy2(REPO_DIR / "classifier_fusion.pth", BASELINE_DIR / "weights" / "classifier_fusion.pth")
+shutil.copy2(REPO_DIR / "fusion_scaler_mean.npy", BASELINE_DIR / "weights" / "fusion_scaler_mean.npy")
+shutil.copy2(REPO_DIR / "fusion_scaler_std.npy", BASELINE_DIR / "weights" / "fusion_scaler_std.npy")
 
-zip_path = ROOT_DIR / "submission.zip"
+zip_path = KAGGLE_WORKING / "submission.zip"
 exclude_dirs = [".git", "classifier"]
 
 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
