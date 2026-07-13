@@ -49,9 +49,8 @@ if not BASELINE_DIR.exists():
 # NOTE: Since CARE-PD_github contains MoMask, we clone it. If the original repo doesn't have the weights, 
 # you should clone your own Github repo instead! For now, we assume you cloned your codebase to CARE-PD_github.
 if not CAREPD_DIR.exists():
-    # User should replace this URL with their own GitHub repo URL that contains the MoMask assets!
-    print("WARNING: Make sure you have the CARE-PD_github MoMask code and assets accessible on Kaggle!")
-    # run_cmd("git clone <YOUR_GITHUB_URL> CARE-PD_github")
+    print("Cloning your codebase containing MoMask assets...")
+    run_cmd("git clone https://github.com/Aditya-Lingam-9000/MoCha-26.git CARE-PD_github")
 
 if not DATASET_DIR.exists():
     print("Downloading CARE-PD dataset from HuggingFace...")
