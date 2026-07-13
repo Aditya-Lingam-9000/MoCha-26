@@ -10,7 +10,10 @@ Canonicalized_SMPL_pickles/
 weights/
 assets/
 MoCha_baseline_bundle/weights/
+!MoCha_baseline_bundle/weights/backbone/motion_encoder_finetuned.pth
 CARE-PD_github/assets/
+!CARE-PD_github/assets/Pretrained_checkpoints/momask/net_best_fid.tar
+!CARE-PD_github/assets/Pretrained_checkpoints/momask/opt.txt
 
 # Zips
 *.zip

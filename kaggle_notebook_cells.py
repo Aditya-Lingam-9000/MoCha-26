@@ -32,6 +32,17 @@ def run_cmd(cmd):
     print(f"Running: {cmd}")
     subprocess.run(cmd, shell=True, check=True)
 
+def merge_dirs(src, dst):
+    src = Path(src)
+    dst = Path(dst)
+    for item in src.rglob("*"):
+        if item.is_file():
+            rel_path = item.relative_to(src)
+            target = dst / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copy2(item, target)
+
 print("--- 1. Setting up Environment & Downloading Weights/Datasets ---")
 run_cmd("pip install huggingface_hub pandas scikit-learn lightgbm numpy torch tqdm")
 
@@ -50,23 +61,21 @@ CAREPD_DIR = REPO_DIR / "CARE-PD_github"
 
 # 2. Download Baseline weights by cloning the original baseline bundle
 TEMP_BASELINE = KAGGLE_WORKING / "temp_baseline"
-if not (BASELINE_DIR / "weights").exists():
-    if not TEMP_BASELINE.exists():
-        run_cmd(f"git clone https://github.com/TaatiTeam/MoCha_baseline_bundle {TEMP_BASELINE}")
-        run_cmd(f"cd {TEMP_BASELINE} && git lfs pull")
-    shutil.copytree(TEMP_BASELINE / "weights", BASELINE_DIR / "weights")
+if not TEMP_BASELINE.exists():
+    run_cmd(f"git clone https://github.com/TaatiTeam/MoCha_baseline_bundle {TEMP_BASELINE}")
+    run_cmd(f"cd {TEMP_BASELINE} && git lfs pull")
+merge_dirs(TEMP_BASELINE / "weights", BASELINE_DIR / "weights")
 
-# 3. Download MoMask weights by cloning the original CARE-PD repo
+# 3. Download MoMask assets by cloning the original CARE-PD repo
 TEMP_CAREPD = KAGGLE_WORKING / "temp_carepd"
-if not (CAREPD_DIR / "assets").exists():
-    if not TEMP_CAREPD.exists():
-        run_cmd(f"git clone https://github.com/TaatiTeam/CARE-PD.git {TEMP_CAREPD}")
-    shutil.copytree(TEMP_CAREPD / "assets", CAREPD_DIR / "assets")
+if not TEMP_CAREPD.exists():
+    run_cmd(f"git clone https://github.com/TaatiTeam/CARE-PD.git {TEMP_CAREPD}")
+merge_dirs(TEMP_CAREPD / "assets", CAREPD_DIR / "assets")
 
 # 4. Download CARE-PD Dataset Pickles from HuggingFace
 if not DATASET_DIR.exists():
     print("Downloading CARE-PD dataset from HuggingFace...")
-    run_cmd(f"huggingface-cli download vida-adl/CARE-PD --local-dir {DATASET_DIR} --repo-type dataset")
+    run_cmd(f"hf download vida-adl/CARE-PD --local-dir {DATASET_DIR} --repo-type dataset")
 
 # Change directory to the repository root so imports work naturally
 os.chdir(str(REPO_DIR))
