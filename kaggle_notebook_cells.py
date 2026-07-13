@@ -1,0 +1,260 @@
+# ==============================================================================
+# MoCha 2026 - Kaggle Semi-Supervised Pipeline (Target: 0.65+)
+# ==============================================================================
+# INSTRUCTIONS FOR KAGGLE:
+# 1. Create a new Notebook on Kaggle.
+# 2. Select Accelerator: GPU T4 x2 (or P100).
+# 3. Turn ON "Internet" in the Notebook settings.
+# 4. Copy-paste this entire script into a cell and run it!
+# ==============================================================================
+
+import os
+import subprocess
+import sys
+import gc
+import pickle
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from pathlib import Path
+from tqdm import tqdm
+import shutil
+import zipfile
+import collections
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import f1_score
+
+def run_cmd(cmd):
+    print(f"Running: {cmd}")
+    subprocess.run(cmd, shell=True, check=True)
+
+print("--- 1. Setting up Environment ---")
+run_cmd("pip install huggingface_hub pandas scikit-learn lightgbm numpy torch tqdm")
+
+# Define Kaggle paths
+ROOT_DIR = Path("/kaggle/working").resolve()
+BASELINE_DIR = ROOT_DIR / "MoCha_baseline_bundle"
+CAREPD_DIR = ROOT_DIR / "CARE-PD_github" 
+DATASET_DIR = ROOT_DIR / "CARE-PD"
+
+# Download Repos
+if not BASELINE_DIR.exists():
+    run_cmd("git clone https://github.com/TaatiTeam/MoCha_baseline_bundle")
+    run_cmd(f"cd {BASELINE_DIR} && git lfs pull")
+
+# NOTE: Since CARE-PD_github contains MoMask, we clone it. If the original repo doesn't have the weights, 
+# you should clone your own Github repo instead! For now, we assume you cloned your codebase to CARE-PD_github.
+if not CAREPD_DIR.exists():
+    # User should replace this URL with their own GitHub repo URL that contains the MoMask assets!
+    print("WARNING: Make sure you have the CARE-PD_github MoMask code and assets accessible on Kaggle!")
+    # run_cmd("git clone <YOUR_GITHUB_URL> CARE-PD_github")
+
+if not DATASET_DIR.exists():
+    print("Downloading CARE-PD dataset from HuggingFace...")
+    run_cmd("huggingface-cli download vida-adl/CARE-PD --local-dir CARE-PD --repo-type dataset")
+
+print("--- 2. Extracting Features (Supervised & Unsupervised) ---")
+# Import dependencies from the cloned bundles
+sys.path.insert(0, str(BASELINE_DIR))
+sys.modules.pop('model', None)
+import model as baseline_model_module
+from submission.preprocess import MotionPreprocessor
+from utils.get_opt import get_opt as baseline_get_opt
+from model.t2m_eval_wrapper import EvaluatorModelWrapper
+
+sys.path.insert(0, str(CAREPD_DIR))
+sys.modules.pop('model', None)
+sys.modules.pop('utils', None)
+sys.modules.pop('utils.get_opt', None)
+from model.momask.model import RVQVAE
+from model.momask.get_opt import get_opt as momask_get_opt
+
+def load_pretrained_weights(model, checkpoint):
+    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    model_dict = model.state_dict()
+    model_first_key = next(iter(model_dict))
+    new_state_dict = collections.OrderedDict()
+    for k, v in state_dict.items():
+        if not 'module.' in model_first_key:
+            if k.startswith('module.'):
+                k = k[7:]
+        if k in model_dict:
+            new_state_dict[k] = v
+    model_dict.update(new_state_dict)
+    model.load_state_dict(model_dict, strict=True)
+
+def extract_time_series_stats(tensor):
+    mean = tensor.mean(dim=1).squeeze(0)
+    std = tensor.std(dim=1).squeeze(0)
+    max_v, _ = tensor.max(dim=1)
+    max_v = max_v.squeeze(0)
+    min_v, _ = tensor.min(dim=1)
+    min_v = min_v.squeeze(0)
+    std = torch.nan_to_num(std, 0.0)
+    return torch.cat([mean, std, max_v, min_v])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Set up Extractors
+opt_path = BASELINE_DIR / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
+chk_path = BASELINE_DIR / "weights" / "backbone" / "motion_encoder_finetuned.pth"
+opt = baseline_get_opt(opt_path, device)
+opt.checkpoints_dir = str(BASELINE_DIR / "weights" / "backbone")
+baseline_wrapper = EvaluatorModelWrapper(opt)
+state = torch.load(chk_path, map_location=device, weights_only=True)
+baseline_wrapper.motion_encoder.load_state_dict(state)
+baseline_wrapper.motion_encoder.eval()
+baseline_wrapper.movement_encoder.eval()
+
+opt_path_m = str(CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask" / "opt.txt")
+chk_path_m = str(CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask" / "net_best_fid.tar")
+vq_opt = momask_get_opt(opt_path_m, device=device)
+momask_model = RVQVAE(args=vq_opt, input_width=263, nb_code=vq_opt.nb_code, code_dim=vq_opt.code_dim, 
+               output_emb_width=vq_opt.code_dim, down_t=vq_opt.down_t, stride_t=vq_opt.stride_t, 
+               width=vq_opt.width, depth=vq_opt.depth, dilation_growth_rate=vq_opt.dilation_growth_rate, 
+               activation=vq_opt.vq_act, norm=vq_opt.vq_norm)
+checkpoint = torch.load(chk_path_m, map_location=device)['net']
+load_pretrained_weights(momask_model, checkpoint)
+momask_model.eval()
+momask_model.to(device)
+
+preprocess = MotionPreprocessor(
+    smpl_model_path=BASELINE_DIR / "weights" / "smpl" / "SMPL_NEUTRAL.pkl",
+    normalization_dir=BASELINE_DIR / "weights" / "stats" / "pdgam",
+    device=device, sequence_len=200, target_fps=25.0, apply_slope_correction=False,
+)
+
+pkl_files = list((DATASET_DIR / "Canonicalized_SMPL_pickles").glob("*.pkl"))
+records = []
+for pkl_file in pkl_files:
+    with open(pkl_file, "rb") as f:
+        data = pickle.load(f)
+    for subject_id, walks in tqdm(data.items(), desc=pkl_file.name):
+        for walk_id, sample in walks.items():
+            label = sample.get("UPDRS_GAIT", -1) # Default to -1 for unsupervised
+            if label is None:
+                label = -1
+                
+            motion, length = preprocess(sample)
+            motion_tensor = torch.as_tensor(motion[None], dtype=torch.float32, device=device)
+            
+            with torch.no_grad():
+                raw_stats = extract_time_series_stats(motion_tensor)
+                length_tensor = torch.as_tensor([length], dtype=torch.long, device=device)
+                baseline_emb = baseline_wrapper.get_motion_embeddings_ordered(motion_tensor, length_tensor).squeeze(0)
+                
+                momask_out = momask_model(motion_tensor)
+                if isinstance(momask_out, tuple): momask_out = momask_out[0]
+                momask_stats = extract_time_series_stats(momask_out) if momask_out.shape[-1] == 512 else extract_time_series_stats(momask_out.permute(0, 2, 1))
+                    
+            combined = torch.cat([raw_stats, baseline_emb, momask_stats]).cpu().numpy()
+            row = {'subject_id': subject_id, 'walk_id': walk_id, 'label': label}
+            for i, v in enumerate(combined): row[f'f_{i}'] = v
+            records.append(row)
+            
+df = pd.DataFrame(records)
+print(f"Extraction Complete. Fused Shape: {df.shape}")
+
+print("--- 3. Semi-Supervised Domain Adaptation ---")
+class FusionClassifier(nn.Module):
+    def __init__(self, input_dim=3612, num_classes=4):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 1024), nn.BatchNorm1d(1024), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(1024, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(256, num_classes),
+        )
+    def forward(self, x): return self.fc(x)
+
+df_sup = df[df['label'] != -1].copy()
+df_unsup = df[df['label'] == -1].copy()
+
+X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label']).values
+y_sup = df_sup['label'].values
+X_unsup = df_unsup.drop(columns=['subject_id', 'walk_id', 'label']).values
+
+# Fit scaler on supervised, apply to both
+X_mean = X_sup.mean(axis=0, keepdims=True)
+X_std = X_sup.std(axis=0, keepdims=True) + 1e-8
+X_sup = (X_sup - X_mean) / X_std
+X_unsup = (X_unsup - X_mean) / X_std
+
+np.save(ROOT_DIR / "fusion_scaler_mean.npy", X_mean)
+np.save(ROOT_DIR / "fusion_scaler_std.npy", X_std)
+
+# Train initial model
+print("Training initial PyTorch model on supervised data...")
+model = FusionClassifier().to(device)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+criterion = nn.CrossEntropyLoss()
+train_loader = DataLoader(TensorDataset(torch.tensor(X_sup, dtype=torch.float32, device=device), 
+                                      torch.tensor(y_sup, dtype=torch.long, device=device)), 
+                          batch_size=32, shuffle=True)
+
+for epoch in range(15):
+    model.train()
+    for bx, by in train_loader:
+        optimizer.zero_grad()
+        loss = criterion(model(bx), by)
+        loss.backward()
+        optimizer.step()
+
+# Pseudo-Labeling
+print("Generating Pseudo-Labels for Unsupervised Data...")
+model.eval()
+with torch.no_grad():
+    unsup_tensor = torch.tensor(X_unsup, dtype=torch.float32, device=device)
+    logits = model(unsup_tensor)
+    probs = F.softmax(logits, dim=1)
+    max_probs, pseudo_labels = torch.max(probs, dim=1)
+    
+confident_idx = max_probs > 0.90
+X_pseudo = X_unsup[confident_idx.cpu().numpy()]
+y_pseudo = pseudo_labels[confident_idx].cpu().numpy()
+
+print(f"Kept {len(y_pseudo)} highly confident unsupervised samples!")
+
+X_combined = np.vstack([X_sup, X_pseudo])
+y_combined = np.concatenate([y_sup, y_pseudo])
+
+print("Retraining on Combined Dataset...")
+model_final = FusionClassifier().to(device)
+optimizer = optim.AdamW(model_final.parameters(), lr=1e-3, weight_decay=1e-2)
+train_loader_final = DataLoader(TensorDataset(torch.tensor(X_combined, dtype=torch.float32, device=device), 
+                                            torch.tensor(y_combined, dtype=torch.long, device=device)), 
+                                batch_size=32, shuffle=True)
+
+for epoch in range(20):
+    model_final.train()
+    for bx, by in train_loader_final:
+        optimizer.zero_grad()
+        loss = criterion(model_final(bx), by)
+        loss.backward()
+        optimizer.step()
+        
+torch.save(model_final.state_dict(), ROOT_DIR / "classifier_fusion.pth")
+print("Saved final domain-adapted model!")
+
+print("--- 4. Packaging Submission ---")
+# The packaging logic dynamically creates the zip on Kaggle
+shutil.copy2(ROOT_DIR / "classifier_fusion.pth", BASELINE_DIR / "weights" / "classifier_fusion.pth")
+shutil.copy2(ROOT_DIR / "fusion_scaler_mean.npy", BASELINE_DIR / "weights" / "fusion_scaler_mean.npy")
+shutil.copy2(ROOT_DIR / "fusion_scaler_std.npy", BASELINE_DIR / "weights" / "fusion_scaler_std.npy")
+
+zip_path = ROOT_DIR / "submission.zip"
+exclude_dirs = [".git", "classifier"]
+
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    for root, dirs, files in os.walk(BASELINE_DIR):
+        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.')]
+        for file in files:
+            if file.endswith('.pyc'): continue
+            file_path = Path(root) / file
+            arcname = file_path.relative_to(BASELINE_DIR)
+            zipf.write(file_path, arcname)
+
+print(f"Kaggle Pipeline Complete! Download {zip_path} from the Kaggle Output section and submit to CodaBench!")

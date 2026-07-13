@@ -15,6 +15,43 @@ from utils.get_opt import get_opt as baseline_get_opt
 
 ROOT = Path(__file__).resolve().parents[1]
 
+class GradientReversalLayer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class OrdinalDANNModel(nn.Module):
+    def __init__(self, input_dim=256, num_domains=4):
+        super().__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+        self.severity_predictor = nn.Linear(128, 1)
+        self.domain_predictor = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64, num_domains)
+        )
+        
+    def forward(self, x, alpha=1.0):
+        features = self.feature_extractor(x)
+        severity = self.severity_predictor(features)
+        reversed_features = GradientReversalLayer.apply(features, alpha)
+        domain = self.domain_predictor(reversed_features)
+        return severity, domain
+
 def choose_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -30,7 +67,7 @@ def load_pretrained_weights(model, checkpoint):
         if k in model_dict:
             new_state_dict[k] = v
     model_dict.update(new_state_dict)
-    model.load_state_dict(model_dict, strict=True)
+    model.load_state_dict(model_dict, strict=False)
 
 def extract_time_series_stats(tensor):
     mean = tensor.mean(dim=1).squeeze(0)
@@ -41,30 +78,6 @@ def extract_time_series_stats(tensor):
     min_v = min_v.squeeze(0)
     std = torch.nan_to_num(std, 0.0)
     return torch.cat([mean, std, max_v, min_v])
-
-class DANNModel(nn.Module):
-    def __init__(self, input_dim: int = 256, num_classes: int = 4):
-        super().__init__()
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.4)
-        )
-        self.class_predictor = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, num_classes)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.class_predictor(self.feature_extractor(x))
 
 class Model:
     def __init__(self):
@@ -79,7 +92,13 @@ class Model:
         )
         self.baseline_wrapper = self._load_baseline()
         self.momask_model = self._load_momask()
-        self.dann_model = self._load_classifier()
+        
+        # Load Ordinal DANN
+        self.dann_model = OrdinalDANNModel(input_dim=256).to(self.device)
+        dann_state = torch.load(ROOT / "weights" / "classifier_ordinal_dann.pth", map_location=self.device, weights_only=True)
+        self.thresholds = dann_state.pop('optimized_thresholds').cpu().numpy()
+        self.dann_model.load_state_dict(dann_state, strict=False)
+        self.dann_model.eval()
         
         # Load Standard Scaler
         self.scaler_mean = torch.load(ROOT / "weights" / "scaler_mean.pt", map_location=self.device)
@@ -118,26 +137,17 @@ class Model:
         model.to(self.device)
         return model
 
-    def _load_classifier(self):
-        model = DANNModel().to(self.device)
-        model.load_state_dict(torch.load(ROOT / "weights" / "classifier_dann.pth", map_location=self.device, weights_only=True))
-        model.eval()
-        return model
-
     def predict(self, sample: Mapping[str, Any]) -> int:
         motion, length = self.preprocess(sample)
         motion_tensor = torch.as_tensor(motion[None], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            # 1. Raw Stats
             raw_stats = extract_time_series_stats(motion_tensor)
             
-            # 2. Baseline
             length_tensor = torch.as_tensor([length], dtype=torch.long, device=self.device)
             baseline_emb = self.baseline_wrapper.get_motion_embeddings_ordered(motion_tensor, length_tensor)
             baseline_emb = baseline_emb.squeeze(0)
             
-            # 3. MoMask
             momask_out = self.momask_model(motion_tensor)
             if isinstance(momask_out, tuple):
                 momask_out = momask_out[0]
@@ -148,14 +158,19 @@ class Model:
                 
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).unsqueeze(0)
             
-            # 4. Standard Scaler
             combined_scaled = (combined - self.scaler_mean) / self.scaler_std
-            
-            # 5. Pure PyTorch PCA Projection (Mathematical, 0% sklearn dependency)
             combined_pca = torch.matmul(combined_scaled - self.pca_mean, self.pca_components.T)
             
-            # 6. DANN Classification
-            logits = self.dann_model(combined_pca)
-            prediction = torch.argmax(logits, dim=1)
+            continuous_score, _ = self.dann_model(combined_pca, alpha=0.0)
+            score = continuous_score.item()
             
-        return int(prediction.item())
+            if score < self.thresholds[0]:
+                prediction = 0
+            elif score >= self.thresholds[0] and score < self.thresholds[1]:
+                prediction = 1
+            elif score >= self.thresholds[1] and score < self.thresholds[2]:
+                prediction = 2
+            else:
+                prediction = 3
+            
+        return int(prediction)
