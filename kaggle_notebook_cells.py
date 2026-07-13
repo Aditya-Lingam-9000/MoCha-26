@@ -70,18 +70,20 @@ if not DATASET_DIR.exists():
 
 # Change directory to the repository root so imports work naturally
 os.chdir(str(REPO_DIR))
-sys.path.insert(0, str(REPO_DIR))
-sys.path.insert(0, str(BASELINE_DIR))
-sys.path.insert(0, str(CAREPD_DIR))
 
 print("--- 2. Extracting Features (Supervised & Unsupervised) ---")
-# Import dependencies
+# Import baseline dependencies using temporary path insertion to avoid namespace conflicts
+sys.path.insert(0, str(BASELINE_DIR))
 from submission.preprocess import MotionPreprocessor
 from utils.get_opt import get_opt as baseline_get_opt
 from model.t2m_eval_wrapper import EvaluatorModelWrapper
+sys.path.remove(str(BASELINE_DIR))
 
+# Import MoMask dependencies using temporary path insertion to avoid namespace conflicts
+sys.path.insert(0, str(CAREPD_DIR))
 from model.momask.model import RVQVAE
 from model.momask.get_opt import get_opt as momask_get_opt
+sys.path.remove(str(CAREPD_DIR))
 
 def load_pretrained_weights(model, checkpoint):
     state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
@@ -109,7 +111,8 @@ def extract_time_series_stats(tensor):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Set up Extractors
+# Set up Extractors (we temporarily append paths during initialization to resolve internal sub-imports)
+sys.path.insert(0, str(BASELINE_DIR))
 opt_path = BASELINE_DIR / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
 chk_path = BASELINE_DIR / "weights" / "backbone" / "motion_encoder_finetuned.pth"
 opt = baseline_get_opt(opt_path, device)
@@ -119,7 +122,9 @@ state = torch.load(chk_path, map_location=device, weights_only=True)
 baseline_wrapper.motion_encoder.load_state_dict(state)
 baseline_wrapper.motion_encoder.eval()
 baseline_wrapper.movement_encoder.eval()
+sys.path.remove(str(BASELINE_DIR))
 
+sys.path.insert(0, str(CAREPD_DIR))
 opt_path_m = str(CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask" / "opt.txt")
 chk_path_m = str(CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask" / "net_best_fid.tar")
 vq_opt = momask_get_opt(opt_path_m, device=device)
@@ -131,15 +136,24 @@ checkpoint = torch.load(chk_path_m, map_location=device)['net']
 load_pretrained_weights(momask_model, checkpoint)
 momask_model.eval()
 momask_model.to(device)
+sys.path.remove(str(CAREPD_DIR))
 
+# Temporarily insert BASELINE_DIR to initialize preprocess model which pulls from data.preprocessing
+sys.path.insert(0, str(BASELINE_DIR))
 preprocess = MotionPreprocessor(
     smpl_model_path=BASELINE_DIR / "weights" / "smpl" / "SMPL_NEUTRAL.pkl",
     normalization_dir=BASELINE_DIR / "weights" / "stats" / "pdgam",
     device=device, sequence_len=200, target_fps=25.0, apply_slope_correction=False,
 )
+sys.path.remove(str(BASELINE_DIR))
 
 pkl_files = list((DATASET_DIR / "Canonicalized_SMPL_pickles").glob("*.pkl"))
 records = []
+
+# We keep both BASELINE_DIR and CAREPD_DIR in path during loop to allow dynamically loaded models to access their dependencies
+sys.path.insert(0, str(BASELINE_DIR))
+sys.path.insert(0, str(CAREPD_DIR))
+
 for pkl_file in pkl_files:
     with open(pkl_file, "rb") as f:
         data = pickle.load(f)
@@ -165,6 +179,10 @@ for pkl_file in pkl_files:
             row = {'subject_id': subject_id, 'walk_id': walk_id, 'label': label}
             for i, v in enumerate(combined): row[f'f_{i}'] = v
             records.append(row)
+
+# Clean up path after loop
+sys.path.remove(str(CAREPD_DIR))
+sys.path.remove(str(BASELINE_DIR))
             
 df = pd.DataFrame(records)
 print(f"Extraction Complete. Fused Shape: {df.shape}")
