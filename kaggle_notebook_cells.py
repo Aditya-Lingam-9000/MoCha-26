@@ -98,18 +98,25 @@ if not DATASET_DIR.exists():
     
     # Disable progress bars to prevent Kaggle's HTML/JS notebook UI from freezing
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-    print("Downloading files quietly to prevent notebook UI freezes (takes ~1 minute)...")
     
-    from huggingface_hub import snapshot_download
-    # Using max_workers=1 is CRITICAL to prevent unauthenticated rate-limit hangs
-    snapshot_download(
-        repo_id="vida-adl/CARE-PD", 
-        repo_type="dataset", 
-        local_dir=DATASET_DIR, 
-        max_workers=1, 
-        resume_download=True
-    )
-    print("CARE-PD dataset downloaded successfully!")
+    from huggingface_hub import list_repo_files, hf_hub_download
+    print("Listing files in CARE-PD dataset repository...")
+    try:
+        files = list_repo_files(repo_id="vida-adl/CARE-PD", repo_type="dataset")
+        print(f"Found {len(files)} files to download sequentially.")
+        for idx, file in enumerate(files):
+            print(f"[{idx+1}/{len(files)}] Downloading: {file} ...")
+            hf_hub_download(
+                repo_id="vida-adl/CARE-PD", 
+                filename=file,
+                repo_type="dataset", 
+                local_dir=DATASET_DIR, 
+                resume_download=True
+            )
+        print("CARE-PD dataset downloaded successfully!")
+    except Exception as e:
+        print(f"Error downloading dataset: {e}")
+        print("Please check your internet connection or Hugging Face credentials.")
 
 # Change directory to the repository root so imports work naturally
 os.chdir(str(REPO_DIR))
