@@ -91,10 +91,14 @@ if not DATASET_DIR.exists():
     except Exception:
         pass
 
+    # Use the official HF mirror ONLY if unauthenticated to bypass bandwidth throttling
     if not hf_token:
-        # Use the official HF mirror ONLY if unauthenticated to bypass bandwidth throttling
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
         print("No HF_TOKEN found. Redirecting HuggingFace downloads to hf-mirror.com...")
+    
+    # Disable progress bars to prevent Kaggle's HTML/JS notebook UI from freezing
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    print("Downloading files quietly to prevent notebook UI freezes (takes ~1 minute)...")
     
     from huggingface_hub import snapshot_download
     # Using max_workers=1 is CRITICAL to prevent unauthenticated rate-limit hangs
@@ -105,6 +109,7 @@ if not DATASET_DIR.exists():
         max_workers=1, 
         resume_download=True
     )
+    print("CARE-PD dataset downloaded successfully!")
 
 # Change directory to the repository root so imports work naturally
 os.chdir(str(REPO_DIR))
