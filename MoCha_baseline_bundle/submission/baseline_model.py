@@ -6,6 +6,7 @@ import collections
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model.momask.model import RVQVAE
 import model.momask.get_opt as momask_get_opt
@@ -15,42 +16,15 @@ from utils.get_opt import get_opt as baseline_get_opt
 
 ROOT = Path(__file__).resolve().parents[1]
 
-class GradientReversalLayer(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
-
-class OrdinalDANNModel(nn.Module):
-    def __init__(self, input_dim=256, num_domains=4):
+class FusionClassifier(nn.Module):
+    def __init__(self, input_dim=3612, num_classes=4):
         super().__init__()
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(512, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.4)
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 1024), nn.BatchNorm1d(1024), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(1024, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(256, num_classes),
         )
-        self.severity_predictor = nn.Linear(128, 1)
-        self.domain_predictor = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, num_domains)
-        )
-        
-    def forward(self, x, alpha=1.0):
-        features = self.feature_extractor(x)
-        severity = self.severity_predictor(features)
-        reversed_features = GradientReversalLayer.apply(features, alpha)
-        domain = self.domain_predictor(reversed_features)
-        return severity, domain
+    def forward(self, x): return self.fc(x)
 
 def choose_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -93,20 +67,15 @@ class Model:
         self.baseline_wrapper = self._load_baseline()
         self.momask_model = self._load_momask()
         
-        # Load Ordinal DANN
-        self.dann_model = OrdinalDANNModel(input_dim=256).to(self.device)
-        dann_state = torch.load(ROOT / "weights" / "classifier_ordinal_dann.pth", map_location=self.device, weights_only=True)
-        self.thresholds = dann_state.pop('optimized_thresholds').cpu().numpy()
-        self.dann_model.load_state_dict(dann_state, strict=False)
-        self.dann_model.eval()
+        # Load Fusion Model
+        self.fusion_model = FusionClassifier(input_dim=3612, num_classes=4).to(self.device)
+        fusion_state = torch.load(ROOT / "weights" / "classifier_fusion.pth", map_location=self.device, weights_only=True)
+        self.fusion_model.load_state_dict(fusion_state, strict=True)
+        self.fusion_model.eval()
         
-        # Load Standard Scaler
-        self.scaler_mean = torch.load(ROOT / "weights" / "scaler_mean.pt", map_location=self.device)
-        self.scaler_std = torch.load(ROOT / "weights" / "scaler_std.pt", map_location=self.device)
-        
-        # Load PCA tensors
-        self.pca_components = torch.load(ROOT / "weights" / "pca_components.pt", map_location=self.device)
-        self.pca_mean = torch.load(ROOT / "weights" / "pca_mean.pt", map_location=self.device)
+        # Load Numpy Scaler
+        self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "fusion_scaler_mean.npy")).float().to(self.device)
+        self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "fusion_scaler_std.npy")).float().to(self.device)
 
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
@@ -158,19 +127,9 @@ class Model:
                 
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).unsqueeze(0)
             
+            # Predict
             combined_scaled = (combined - self.scaler_mean) / self.scaler_std
-            combined_pca = torch.matmul(combined_scaled - self.pca_mean, self.pca_components.T)
-            
-            continuous_score, _ = self.dann_model(combined_pca, alpha=0.0)
-            score = continuous_score.item()
-            
-            if score < self.thresholds[0]:
-                prediction = 0
-            elif score >= self.thresholds[0] and score < self.thresholds[1]:
-                prediction = 1
-            elif score >= self.thresholds[1] and score < self.thresholds[2]:
-                prediction = 2
-            else:
-                prediction = 3
+            logits = self.fusion_model(combined_scaled)
+            prediction = torch.argmax(logits, dim=1).item()
             
         return int(prediction)
