@@ -78,6 +78,22 @@ if not DATASET_DIR.exists():
     # Clear HF cache locks in case a previous interrupted run left them hanging
     run_cmd("rm -rf ~/.cache/huggingface/hub/.locks")
     
+    import os
+    # Try to load HF_TOKEN from Kaggle Secrets if the user has it configured
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        hf_token = user_secrets.get_secret("HF_TOKEN")
+        if hf_token:
+            os.environ["HF_TOKEN"] = hf_token
+            print("Successfully loaded HF_TOKEN from Kaggle Secrets.")
+    except Exception:
+        pass
+
+    # Use the official HF mirror to bypass severe bandwidth throttling on Kaggle IPs
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    print("Redirecting HuggingFace downloads to hf-mirror.com...")
+    
     from huggingface_hub import snapshot_download
     # Using max_workers=1 is CRITICAL to prevent unauthenticated rate-limit hangs
     snapshot_download(
