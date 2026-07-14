@@ -79,6 +79,7 @@ if not DATASET_DIR.exists():
     run_cmd("rm -rf ~/.cache/huggingface/hub/.locks")
     
     import os
+    hf_token = None
     # Try to load HF_TOKEN from Kaggle Secrets if the user has it configured
     try:
         from kaggle_secrets import UserSecretsClient
@@ -86,13 +87,14 @@ if not DATASET_DIR.exists():
         hf_token = user_secrets.get_secret("HF_TOKEN")
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
-            print("Successfully loaded HF_TOKEN from Kaggle Secrets.")
+            print("Successfully loaded HF_TOKEN from Kaggle Secrets. Downloading from official Hugging Face servers...")
     except Exception:
         pass
 
-    # Use the official HF mirror to bypass severe bandwidth throttling on Kaggle IPs
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-    print("Redirecting HuggingFace downloads to hf-mirror.com...")
+    if not hf_token:
+        # Use the official HF mirror ONLY if unauthenticated to bypass bandwidth throttling
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        print("No HF_TOKEN found. Redirecting HuggingFace downloads to hf-mirror.com...")
     
     from huggingface_hub import snapshot_download
     # Using max_workers=1 is CRITICAL to prevent unauthenticated rate-limit hangs
