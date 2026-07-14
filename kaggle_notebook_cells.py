@@ -75,6 +75,8 @@ merge_dirs(TEMP_CAREPD / "assets", CAREPD_DIR / "assets")
 # 4. Download CARE-PD Dataset Pickles from HuggingFace
 if not DATASET_DIR.exists():
     print("Downloading CARE-PD dataset from HuggingFace...")
+    # Clear HF cache locks in case a previous interrupted run left them hanging
+    run_cmd("rm -rf ~/.cache/huggingface/hub/.locks")
     run_cmd(f"hf download vida-adl/CARE-PD --local-dir {DATASET_DIR} --repo-type dataset")
 
 # Change directory to the repository root so imports work naturally
