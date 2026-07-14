@@ -195,6 +195,8 @@ sys.path.remove(str(BASELINE_DIR))
             
 df = pd.DataFrame(records)
 print(f"Extraction Complete. Fused Shape: {df.shape}")
+df.to_csv(REPO_DIR / "features_fused.csv", index=False)
+print("Saved features to features_fused.csv so you never have to extract again!")
 
 print("--- 3. Semi-Supervised Domain Adaptation ---")
 class FusionClassifier(nn.Module):
@@ -227,7 +229,11 @@ np.save(REPO_DIR / "fusion_scaler_std.npy", X_std)
 print("Training initial PyTorch model on supervised data...")
 model = FusionClassifier().to(device)
 optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
-criterion = nn.CrossEntropyLoss()
+
+from sklearn.utils.class_weight import compute_class_weight
+weights_sup = compute_class_weight('balanced', classes=np.unique(y_sup), y=y_sup)
+criterion_sup = nn.CrossEntropyLoss(weight=torch.tensor(weights_sup, dtype=torch.float32, device=device))
+
 train_loader = DataLoader(TensorDataset(torch.tensor(X_sup, dtype=torch.float32, device=device), 
                                       torch.tensor(y_sup, dtype=torch.long, device=device)), 
                           batch_size=32, shuffle=True)
@@ -236,7 +242,7 @@ for epoch in range(15):
     model.train()
     for bx, by in train_loader:
         optimizer.zero_grad()
-        loss = criterion(model(bx), by)
+        loss = criterion_sup(model(bx), by)
         loss.backward()
         optimizer.step()
 
@@ -261,6 +267,10 @@ y_combined = np.concatenate([y_sup, y_pseudo])
 print("Retraining on Combined Dataset...")
 model_final = FusionClassifier().to(device)
 optimizer = optim.AdamW(model_final.parameters(), lr=1e-3, weight_decay=1e-2)
+
+weights_comb = compute_class_weight('balanced', classes=np.unique(y_combined), y=y_combined)
+criterion_comb = nn.CrossEntropyLoss(weight=torch.tensor(weights_comb, dtype=torch.float32, device=device))
+
 train_loader_final = DataLoader(TensorDataset(torch.tensor(X_combined, dtype=torch.float32, device=device), 
                                             torch.tensor(y_combined, dtype=torch.long, device=device)), 
                                 batch_size=32, shuffle=True)
@@ -269,7 +279,7 @@ for epoch in range(20):
     model_final.train()
     for bx, by in train_loader_final:
         optimizer.zero_grad()
-        loss = criterion(model_final(bx), by)
+        loss = criterion_comb(model_final(bx), by)
         loss.backward()
         optimizer.step()
         
@@ -280,6 +290,12 @@ print("--- 4. Packaging Submission ---")
 shutil.copy2(REPO_DIR / "classifier_fusion.pth", BASELINE_DIR / "weights" / "classifier_fusion.pth")
 shutil.copy2(REPO_DIR / "fusion_scaler_mean.npy", BASELINE_DIR / "weights" / "fusion_scaler_mean.npy")
 shutil.copy2(REPO_DIR / "fusion_scaler_std.npy", BASELINE_DIR / "weights" / "fusion_scaler_std.npy")
+
+momask_dest = BASELINE_DIR / "weights" / "momask"
+momask_dest.mkdir(parents=True, exist_ok=True)
+momask_src = CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask"
+shutil.copy2(momask_src / "opt.txt", momask_dest / "opt.txt")
+shutil.copy2(momask_src / "net_best_fid.tar", momask_dest / "net_best_fid.tar")
 
 zip_path = KAGGLE_WORKING / "submission.zip"
 exclude_dirs = [".git", "classifier"]
