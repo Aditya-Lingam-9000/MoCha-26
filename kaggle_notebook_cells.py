@@ -102,8 +102,11 @@ if not DATASET_DIR.exists():
     from huggingface_hub import list_repo_files, hf_hub_download
     print("Listing files in CARE-PD dataset repository...")
     try:
-        files = list_repo_files(repo_id="vida-adl/CARE-PD", repo_type="dataset")
-        print(f"Found {len(files)} files to download sequentially.")
+        all_files = list_repo_files(repo_id="vida-adl/CARE-PD", repo_type="dataset")
+        # CRITICAL: Filter to ONLY download the preprocessed pickles we actually use!
+        # The root folder contains raw 3D mesh parameters which are 20GB+ and completely unused.
+        files = [f for f in all_files if f.startswith("Canonicalized_SMPL_pickles/")]
+        print(f"Found {len(files)} canonical files to download sequentially.")
         for idx, file in enumerate(files):
             print(f"[{idx+1}/{len(files)}] Downloading: {file} ...")
             hf_hub_download(
