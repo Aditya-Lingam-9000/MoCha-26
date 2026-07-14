@@ -77,7 +77,16 @@ if not DATASET_DIR.exists():
     print("Downloading CARE-PD dataset from HuggingFace...")
     # Clear HF cache locks in case a previous interrupted run left them hanging
     run_cmd("rm -rf ~/.cache/huggingface/hub/.locks")
-    run_cmd(f"hf download vida-adl/CARE-PD --local-dir {DATASET_DIR} --repo-type dataset")
+    
+    from huggingface_hub import snapshot_download
+    # Using max_workers=1 is CRITICAL to prevent unauthenticated rate-limit hangs
+    snapshot_download(
+        repo_id="vida-adl/CARE-PD", 
+        repo_type="dataset", 
+        local_dir=DATASET_DIR, 
+        max_workers=1, 
+        resume_download=True
+    )
 
 # Change directory to the repository root so imports work naturally
 os.chdir(str(REPO_DIR))
