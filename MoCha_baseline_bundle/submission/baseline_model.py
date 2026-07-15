@@ -16,16 +16,6 @@ from utils.get_opt import get_opt as baseline_get_opt
 
 ROOT = Path(__file__).resolve().parents[1]
 
-class FusionClassifier(nn.Module):
-    def __init__(self, input_dim=3612, num_classes=4):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 1024), nn.BatchNorm1d(1024), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(1024, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(256, num_classes),
-        )
-    def forward(self, x): return self.fc(x)
-
 def choose_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -67,13 +57,10 @@ class Model:
         self.baseline_wrapper = self._load_baseline()
         self.momask_model = self._load_momask()
         
-        # Load Fusion Model
-        self.fusion_model = FusionClassifier(input_dim=3612, num_classes=4).to(self.device)
-        fusion_state = torch.load(ROOT / "weights" / "classifier_fusion.pth", map_location=self.device, weights_only=True)
-        self.fusion_model.load_state_dict(fusion_state, strict=True)
-        self.fusion_model.eval()
-        
-        # Load Numpy Scaler
+        # Load Logistic Regression weights
+        self.valid_features = torch.from_numpy(np.load(ROOT / "weights" / "valid_features.npy")).long().to(self.device)
+        self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
+        self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
         self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "fusion_scaler_mean.npy")).float().to(self.device)
         self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "fusion_scaler_std.npy")).float().to(self.device)
 
@@ -128,8 +115,9 @@ class Model:
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).unsqueeze(0)
             
             # Predict
-            combined_scaled = (combined - self.scaler_mean) / self.scaler_std
-            logits = self.fusion_model(combined_scaled)
+            combined_filtered = combined[:, self.valid_features]
+            combined_scaled = (combined_filtered - self.scaler_mean) / self.scaler_std
+            logits = torch.matmul(combined_scaled, self.coef.t()) + self.intercept
             prediction = torch.argmax(logits, dim=1).item()
             
         return int(prediction)

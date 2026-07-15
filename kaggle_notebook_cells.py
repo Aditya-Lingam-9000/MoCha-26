@@ -243,15 +243,7 @@ df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
 print("--- 3. Semi-Supervised Domain Adaptation ---")
-class FusionClassifier(nn.Module):
-    def __init__(self, input_dim=3612, num_classes=4):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 1024), nn.BatchNorm1d(1024), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(1024, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(256, num_classes),
-        )
-    def forward(self, x): return self.fc(x)
+from sklearn.linear_model import LogisticRegression
 
 df_sup = df[df['label'] != -1].copy()
 df_unsup = df[df['label'] == -1].copy()
@@ -260,78 +252,58 @@ X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label']).values
 y_sup = df_sup['label'].values
 X_unsup = df_unsup.drop(columns=['subject_id', 'walk_id', 'label']).values
 
-# Fit scaler on supervised, apply to both
+# 1. Filter out features with very low variance to prevent scale blowups on test set
+variances = np.var(X_sup, axis=0)
+valid_features_idx = np.where(variances > 1e-4)[0]
+print(f"Filtering features: kept {len(valid_features_idx)} out of {X_sup.shape[1]} features.")
+np.save(REPO_DIR / "valid_features.npy", valid_features_idx)
+
+X_sup = X_sup[:, valid_features_idx]
+X_unsup = X_unsup[:, valid_features_idx]
+
+# 2. Fit scaler on supervised, apply to both (using 1e-2 epsilon for safe division)
 X_mean = X_sup.mean(axis=0, keepdims=True)
-X_std = X_sup.std(axis=0, keepdims=True) + 1e-8
-X_sup = (X_sup - X_mean) / X_std
-X_unsup = (X_unsup - X_mean) / X_std
+X_std = X_sup.std(axis=0, keepdims=True) + 1e-2
+X_sup_scaled = (X_sup - X_mean) / X_std
+X_unsup_scaled = (X_unsup - X_mean) / X_std
 
 np.save(REPO_DIR / "fusion_scaler_mean.npy", X_mean)
 np.save(REPO_DIR / "fusion_scaler_std.npy", X_std)
 
-# Train initial model
-print("Training initial PyTorch model on supervised data...")
-model = FusionClassifier().to(device)
-optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+# 3. Train initial Logistic Regression model on supervised data
+print("Training initial Logistic Regression on supervised data...")
+clf = LogisticRegression(C=0.1, class_weight='balanced', max_iter=1000)
+clf.fit(X_sup_scaled, y_sup)
 
-from sklearn.utils.class_weight import compute_class_weight
-weights_sup = compute_class_weight('balanced', classes=np.unique(y_sup), y=y_sup)
-criterion_sup = nn.CrossEntropyLoss(weight=torch.tensor(weights_sup, dtype=torch.float32, device=device))
-
-train_loader = DataLoader(TensorDataset(torch.tensor(X_sup, dtype=torch.float32, device=device), 
-                                      torch.tensor(y_sup, dtype=torch.long, device=device)), 
-                          batch_size=32, shuffle=True)
-
-for epoch in range(15):
-    model.train()
-    for bx, by in train_loader:
-        optimizer.zero_grad()
-        loss = criterion_sup(model(bx), by)
-        loss.backward()
-        optimizer.step()
-
-# Pseudo-Labeling
+# 4. Generate Pseudo-Labels for Unsupervised Data
 print("Generating Pseudo-Labels for Unsupervised Data...")
-model.eval()
-with torch.no_grad():
-    unsup_tensor = torch.tensor(X_unsup, dtype=torch.float32, device=device)
-    logits = model(unsup_tensor)
-    probs = F.softmax(logits, dim=1)
-    max_probs, pseudo_labels = torch.max(probs, dim=1)
-    
-confident_idx = max_probs > 0.90
-X_pseudo = X_unsup[confident_idx.cpu().numpy()]
-y_pseudo = pseudo_labels[confident_idx].cpu().numpy()
+probs = clf.predict_proba(X_unsup_scaled)
+max_probs = np.max(probs, axis=1)
+pseudo_labels = np.argmax(probs, axis=1)
 
+confident_idx = max_probs > 0.90
+X_pseudo = X_unsup_scaled[confident_idx]
+y_pseudo = pseudo_labels[confident_idx]
 print(f"Kept {len(y_pseudo)} highly confident unsupervised samples!")
 
-X_combined = np.vstack([X_sup, X_pseudo])
+# Combine supervised and pseudo-labeled data
+X_combined = np.vstack([X_sup_scaled, X_pseudo])
 y_combined = np.concatenate([y_sup, y_pseudo])
 
-print("Retraining on Combined Dataset...")
-model_final = FusionClassifier().to(device)
-optimizer = optim.AdamW(model_final.parameters(), lr=1e-3, weight_decay=1e-2)
+# 5. Retrain on Combined Dataset
+print("Retraining Logistic Regression on Combined Dataset...")
+clf_final = LogisticRegression(C=0.1, class_weight='balanced', max_iter=1000)
+clf_final.fit(X_combined, y_combined)
 
-weights_comb = compute_class_weight('balanced', classes=np.unique(y_combined), y=y_combined)
-criterion_comb = nn.CrossEntropyLoss(weight=torch.tensor(weights_comb, dtype=torch.float32, device=device))
-
-train_loader_final = DataLoader(TensorDataset(torch.tensor(X_combined, dtype=torch.float32, device=device), 
-                                            torch.tensor(y_combined, dtype=torch.long, device=device)), 
-                                batch_size=32, shuffle=True)
-
-for epoch in range(20):
-    model_final.train()
-    for bx, by in train_loader_final:
-        optimizer.zero_grad()
-        loss = criterion_comb(model_final(bx), by)
-        loss.backward()
-        optimizer.step()
-        
-torch.save(model_final.state_dict(), REPO_DIR / "classifier_fusion.pth")
-print("Saved final domain-adapted model!")
+# Save final coefficients and intercepts
+np.save(REPO_DIR / "fusion_coef.npy", clf_final.coef_)
+np.save(REPO_DIR / "fusion_intercept.npy", clf_final.intercept_)
+print("Saved final domain-adapted model parameters!")
 
 print("--- 4. Packaging Submission ---")
-shutil.copy2(REPO_DIR / "classifier_fusion.pth", BASELINE_DIR / "weights" / "classifier_fusion.pth")
+shutil.copy2(REPO_DIR / "valid_features.npy", BASELINE_DIR / "weights" / "valid_features.npy")
+shutil.copy2(REPO_DIR / "fusion_coef.npy", BASELINE_DIR / "weights" / "fusion_coef.npy")
+shutil.copy2(REPO_DIR / "fusion_intercept.npy", BASELINE_DIR / "weights" / "fusion_intercept.npy")
 shutil.copy2(REPO_DIR / "fusion_scaler_mean.npy", BASELINE_DIR / "weights" / "fusion_scaler_mean.npy")
 shutil.copy2(REPO_DIR / "fusion_scaler_std.npy", BASELINE_DIR / "weights" / "fusion_scaler_std.npy")
 
