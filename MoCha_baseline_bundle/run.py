@@ -29,15 +29,7 @@ def get_model() -> Model:
 def predict(data: Mapping[str, Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, int]]:
     """Return predictions[subject_id][walk_id] = UPDRS class in {0, 1, 2, 3}."""
     model = get_model()
-    predictions: dict[str, dict[str, int]] = {}
-
-    for subject_id, walks in data.items():
-        subject_key = str(subject_id)
-        predictions[subject_key] = {}
-        for walk_id, sample in walks.items():
-            predictions[subject_key][str(walk_id)] = int(model.predict(sample))
-
-    return predictions
+    return model.predict_dataset(data)
 
 
 def main() -> None:

@@ -57,12 +57,11 @@ class Model:
         self.baseline_wrapper = self._load_baseline()
         self.momask_model = self._load_momask()
         
-        # Load Logistic Regression weights
+        # Load weights
         self.valid_features = torch.from_numpy(np.load(ROOT / "weights" / "valid_features.npy")).long().to(self.device)
         self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
         self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
-        self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "fusion_scaler_mean.npy")).float().to(self.device)
-        self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "fusion_scaler_std.npy")).float().to(self.device)
+        self.thresholds = torch.from_numpy(np.load(ROOT / "weights" / "thresholds.npy")).float().to(self.device)
 
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
@@ -93,31 +92,99 @@ class Model:
         model.to(self.device)
         return model
 
+    def predict_dataset(self, dataset: Mapping[str, Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, int]]:
+        predictions = {}
+        features_list = []
+        keys = []
+        
+        print("Extracting features from dataset...")
+        for subject_id, walks in dataset.items():
+            subject_key = str(subject_id)
+            predictions[subject_key] = {}
+            for walk_id, sample in walks.items():
+                walk_key = str(walk_id)
+                motion, length = self.preprocess(sample)
+                motion_tensor = torch.as_tensor(motion[None], dtype=torch.float32, device=self.device)
+                
+                with torch.no_grad():
+                    raw_stats = extract_time_series_stats(motion_tensor)
+                    
+                    length_tensor = torch.as_tensor([length], dtype=torch.long, device=self.device)
+                    baseline_emb = self.baseline_wrapper.get_motion_embeddings_ordered(motion_tensor, length_tensor)
+                    baseline_emb = baseline_emb.squeeze(0)
+                    
+                    momask_out = self.momask_model(motion_tensor)
+                    if isinstance(momask_out, tuple):
+                        momask_out = momask_out[0]
+                    if momask_out.shape[-1] == 512:
+                        momask_stats = extract_time_series_stats(momask_out)
+                    else:
+                        momask_stats = extract_time_series_stats(momask_out.permute(0, 2, 1))
+                        
+                    combined = torch.cat([raw_stats, baseline_emb, momask_stats])
+                    features_list.append(combined)
+                    keys.append((subject_key, walk_key))
+                    
+        # Batch predict
+        if len(features_list) > 0:
+            features = torch.stack(features_list)
+            
+            with torch.no_grad():
+                # 1. Filter features
+                features_filtered = features[:, self.valid_features]
+                
+                # 2. Site Normalization (Compute mean/std of this test dataset)
+                mean = features_filtered.mean(dim=0, keepdim=True)
+                std = features_filtered.std(dim=0, keepdim=True) + 1e-2
+                features_scaled = (features_filtered - mean) / std
+                
+                # 3. Ridge regression projection
+                scores = torch.matmul(features_scaled, self.coef.t()) + self.intercept
+                scores = scores.squeeze(1)
+                
+                # 4. Map to classes using thresholds
+                t0, t1, t2 = self.thresholds[0], self.thresholds[1], self.thresholds[2]
+                
+                preds = torch.zeros_like(scores, dtype=torch.long)
+                preds[scores >= t0] = 1
+                preds[scores >= t1] = 2
+                preds[scores >= t2] = 3
+                
+                preds_list = preds.cpu().numpy()
+                
+            for idx, (sub_key, walk_key) in enumerate(keys):
+                predictions[sub_key][walk_key] = int(preds_list[idx])
+                
+        return predictions
+
     def predict(self, sample: Mapping[str, Any]) -> int:
         motion, length = self.preprocess(sample)
         motion_tensor = torch.as_tensor(motion[None], dtype=torch.float32, device=self.device)
-
+        
         with torch.no_grad():
             raw_stats = extract_time_series_stats(motion_tensor)
-            
             length_tensor = torch.as_tensor([length], dtype=torch.long, device=self.device)
-            baseline_emb = self.baseline_wrapper.get_motion_embeddings_ordered(motion_tensor, length_tensor)
-            baseline_emb = baseline_emb.squeeze(0)
+            baseline_emb = self.baseline_wrapper.get_motion_embeddings_ordered(motion_tensor, length_tensor).squeeze(0)
             
             momask_out = self.momask_model(motion_tensor)
-            if isinstance(momask_out, tuple):
-                momask_out = momask_out[0]
+            if isinstance(momask_out, tuple): momask_out = momask_out[0]
             if momask_out.shape[-1] == 512:
                 momask_stats = extract_time_series_stats(momask_out)
             else:
                 momask_stats = extract_time_series_stats(momask_out.permute(0, 2, 1))
                 
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).unsqueeze(0)
-            
-            # Predict
             combined_filtered = combined[:, self.valid_features]
-            combined_scaled = (combined_filtered - self.scaler_mean) / self.scaler_std
-            logits = torch.matmul(combined_scaled, self.coef.t()) + self.intercept
-            prediction = torch.argmax(logits, dim=1).item()
             
-        return int(prediction)
+            scores = torch.matmul(combined_filtered, self.coef.t()) + self.intercept
+            score = scores.item()
+            
+            t0, t1, t2 = self.thresholds[0].item(), self.thresholds[1].item(), self.thresholds[2].item()
+            if score < t0:
+                return 0
+            elif score >= t0 and score < t1:
+                return 1
+            elif score >= t1 and score < t2:
+                return 2
+            else:
+                return 3
