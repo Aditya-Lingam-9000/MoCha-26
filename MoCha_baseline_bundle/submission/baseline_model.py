@@ -59,6 +59,9 @@ class Model:
         
         # Load weights
         self.valid_features = torch.from_numpy(np.load(ROOT / "weights" / "valid_features.npy")).long().to(self.device)
+        self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
+        self.pca_components = torch.from_numpy(np.load(ROOT / "weights" / "pca_components.npy")).float().to(self.device)
+        self.pca_mean = torch.from_numpy(np.load(ROOT / "weights" / "pca_mean.npy")).float().to(self.device)
         self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
         self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
         self.thresholds = torch.from_numpy(np.load(ROOT / "weights" / "thresholds.npy")).float().to(self.device)
@@ -138,17 +141,22 @@ class Model:
                 std = features_filtered.std(dim=0, keepdim=True) + 1e-2
                 features_scaled = (features_filtered - mean) / std
                 
-                # 3. Ridge regression projection
-                scores = torch.matmul(features_scaled, self.coef.t()) + self.intercept
-                scores = scores.squeeze(1)
+                # 3. PCA Projection
+                features_pca = torch.matmul(features_scaled - self.pca_mean, self.pca_components.t())
                 
-                # 4. Map to classes using thresholds
-                t0, t1, t2 = self.thresholds[0], self.thresholds[1], self.thresholds[2]
-                
-                preds = torch.zeros_like(scores, dtype=torch.long)
-                preds[scores >= t0] = 1
-                preds[scores >= t1] = 2
-                preds[scores >= t2] = 3
+                # 4. Predict
+                if self.model_type == 1:
+                    scores = torch.matmul(features_pca, self.coef.t()) + self.intercept
+                    scores = scores.squeeze(1)
+                    
+                    t0, t1, t2 = self.thresholds[0], self.thresholds[1], self.thresholds[2]
+                    preds = torch.zeros_like(scores, dtype=torch.long)
+                    preds[scores >= t0] = 1
+                    preds[scores >= t1] = 2
+                    preds[scores >= t2] = 3
+                else:
+                    logits = torch.matmul(features_pca, self.coef.t()) + self.intercept
+                    preds = torch.argmax(logits, dim=1)
                 
                 preds_list = preds.cpu().numpy()
                 
@@ -176,15 +184,23 @@ class Model:
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).unsqueeze(0)
             combined_filtered = combined[:, self.valid_features]
             
-            scores = torch.matmul(combined_filtered, self.coef.t()) + self.intercept
-            score = scores.item()
+            combined_scaled = (combined_filtered - combined_filtered.mean(dim=0, keepdim=True)) / 1.0
+            combined_pca = torch.matmul(combined_scaled - self.pca_mean, self.pca_components.t())
             
-            t0, t1, t2 = self.thresholds[0].item(), self.thresholds[1].item(), self.thresholds[2].item()
-            if score < t0:
-                return 0
-            elif score >= t0 and score < t1:
-                return 1
-            elif score >= t1 and score < t2:
-                return 2
+            if self.model_type == 1:
+                scores = torch.matmul(combined_pca, self.coef.t()) + self.intercept
+                score = scores.item()
+                
+                t0, t1, t2 = self.thresholds[0].item(), self.thresholds[1].item(), self.thresholds[2].item()
+                if score < t0:
+                    return 0
+                elif score >= t0 and score < t1:
+                    return 1
+                elif score >= t1 and score < t2:
+                    return 2
+                else:
+                    return 3
             else:
-                return 3
+                logits = torch.matmul(combined_pca, self.coef.t()) + self.intercept
+                prediction = torch.argmax(logits, dim=1).item()
+                return int(prediction)
