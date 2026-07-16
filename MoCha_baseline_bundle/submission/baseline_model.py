@@ -65,6 +65,8 @@ class Model:
         self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
         self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
         self.thresholds = torch.from_numpy(np.load(ROOT / "weights" / "thresholds.npy")).float().to(self.device)
+        self.global_scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "global_scaler_mean.npy")).float().to(self.device)
+        self.global_scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "global_scaler_std.npy")).float().to(self.device)
 
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
@@ -146,8 +148,11 @@ class Model:
                 
                 # 4. Predict
                 if self.model_type == 1:
-                    scores = torch.matmul(features_pca, self.coef.t()) + self.intercept
-                    scores = scores.squeeze(1)
+                    coef = self.coef
+                    if coef.dim() == 1:
+                        coef = coef.unsqueeze(0)
+                    scores = torch.matmul(features_pca, coef.t()) + self.intercept
+                    scores = scores.squeeze(-1)
                     
                     t0, t1, t2 = self.thresholds[0], self.thresholds[1], self.thresholds[2]
                     preds = torch.zeros_like(scores, dtype=torch.long)
@@ -184,11 +189,14 @@ class Model:
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).unsqueeze(0)
             combined_filtered = combined[:, self.valid_features]
             
-            combined_scaled = (combined_filtered - combined_filtered.mean(dim=0, keepdim=True)) / 1.0
+            combined_scaled = (combined_filtered - self.global_scaler_mean) / self.global_scaler_std
             combined_pca = torch.matmul(combined_scaled - self.pca_mean, self.pca_components.t())
             
             if self.model_type == 1:
-                scores = torch.matmul(combined_pca, self.coef.t()) + self.intercept
+                coef = self.coef
+                if coef.dim() == 1:
+                    coef = coef.unsqueeze(0)
+                scores = torch.matmul(combined_pca, coef.t()) + self.intercept
                 score = scores.item()
                 
                 t0, t1, t2 = self.thresholds[0].item(), self.thresholds[1].item(), self.thresholds[2].item()
