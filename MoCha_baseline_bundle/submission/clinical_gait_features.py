@@ -42,14 +42,18 @@ def extract_clinical_gait_features(joints: np.ndarray, fps: float = 25.0) -> np.
     features.extend(r_arm_rom)
 
     # 2. Leg Velocity & Swing Asymmetry
-    l_ankle_v = np.diff(joints[:, 7, :], axis=0) / dt
-    r_ankle_v = np.diff(joints[:, 8, :], axis=0) / dt
+    if T > 1:
+        l_ankle_v = np.diff(joints[:, 7, :], axis=0) / dt
+        r_ankle_v = np.diff(joints[:, 8, :], axis=0) / dt
 
-    l_ankle_speed = np.linalg.norm(l_ankle_v, axis=1)
-    r_ankle_speed = np.linalg.norm(r_ankle_v, axis=1)
+        l_ankle_speed = np.linalg.norm(l_ankle_v, axis=1)
+        r_ankle_speed = np.linalg.norm(r_ankle_v, axis=1)
 
-    l_speed_max, l_speed_mean, l_speed_std = np.max(l_ankle_speed), np.mean(l_ankle_speed), np.std(l_ankle_speed)
-    r_speed_max, r_speed_mean, r_speed_std = np.max(r_ankle_speed), np.mean(r_ankle_speed), np.std(r_ankle_speed)
+        l_speed_max, l_speed_mean, l_speed_std = float(np.max(l_ankle_speed)), float(np.mean(l_ankle_speed)), float(np.std(l_ankle_speed))
+        r_speed_max, r_speed_mean, r_speed_std = float(np.max(r_ankle_speed)), float(np.mean(r_ankle_speed)), float(np.std(r_ankle_speed))
+    else:
+        l_speed_max, l_speed_mean, l_speed_std = 0.0, 0.0, 0.0
+        r_speed_max, r_speed_mean, r_speed_std = 0.0, 0.0, 0.0
 
     leg_asymmetry_max = abs(l_speed_max - r_speed_max) / (l_speed_max + r_speed_max + 1e-5)
     leg_asymmetry_mean = abs(l_speed_mean - r_speed_mean) / (l_speed_mean + r_speed_mean + 1e-5)
@@ -68,12 +72,12 @@ def extract_clinical_gait_features(joints: np.ndarray, fps: float = 25.0) -> np.
     v2_r = joints[:, 8, :] - joints[:, 5, :]
     r_knee_angles = compute_angle(v1_r, v2_r)
 
-    l_knee_rom = np.ptp(l_knee_angles)
-    r_knee_rom = np.ptp(r_knee_angles)
+    l_knee_rom = float(np.ptp(l_knee_angles)) if T > 1 else 0.0
+    r_knee_rom = float(np.ptp(r_knee_angles)) if T > 1 else 0.0
     knee_asymmetry = abs(l_knee_rom - r_knee_rom)
 
-    features.extend([np.mean(l_knee_angles), np.std(l_knee_angles), l_knee_rom,
-                     np.mean(r_knee_angles), np.std(r_knee_angles), r_knee_rom,
+    features.extend([float(np.mean(l_knee_angles)), float(np.std(l_knee_angles)), l_knee_rom,
+                     float(np.mean(r_knee_angles)), float(np.std(r_knee_angles)), r_knee_rom,
                      knee_asymmetry])
 
     # 4. Postural Stability & Trunk Tilt
@@ -86,33 +90,43 @@ def extract_clinical_gait_features(joints: np.ndarray, fps: float = 25.0) -> np.
     vert_axis = np.array([0.0, 1.0, 0.0])
     trunk_tilt = compute_angle(trunk_dir, vert_axis)
 
-    pelvis_lateral_var = np.var(joints[:, 0, 0])  # Pelvis X sway
-    pelvis_vert_var = np.var(joints[:, 0, 1])     # Pelvis Y bounce
+    pelvis_lateral_var = float(np.var(joints[:, 0, 0]))  # Pelvis X sway
+    pelvis_vert_var = float(np.var(joints[:, 0, 1]))     # Pelvis Y bounce
 
-    features.extend([np.mean(trunk_tilt), np.std(trunk_tilt), np.max(trunk_tilt),
+    features.extend([float(np.mean(trunk_tilt)), float(np.std(trunk_tilt)), float(np.max(trunk_tilt)),
                      pelvis_lateral_var, pelvis_vert_var])
 
     # 5. Frequency Domain: Tremor & Shuffling Power Ratio (3-8 Hz vs 0.5-2.0 Hz)
     # FFT on wrist & ankle accelerations
-    l_wrist_acc = np.diff(joints[:, 20, :], n=2, axis=0) / (dt**2)
-    l_wrist_acc_mag = np.linalg.norm(l_wrist_acc, axis=1)
+    if T >= 3:
+        l_wrist_acc = np.diff(joints[:, 20, :], n=2, axis=0) / (dt**2)
+        l_wrist_acc_mag = np.linalg.norm(l_wrist_acc, axis=1)
 
-    fft_vals = np.abs(np.fft.rfft(l_wrist_acc_mag))
-    fft_freqs = np.fft.rfftfreq(len(l_wrist_acc_mag), d=dt)
+        if len(l_wrist_acc_mag) > 0:
+            fft_vals = np.abs(np.fft.rfft(l_wrist_acc_mag))
+            fft_freqs = np.fft.rfftfreq(len(l_wrist_acc_mag), d=dt)
 
-    gait_mask = (fft_freqs >= 0.5) & (fft_freqs <= 2.0)
-    tremor_mask = (fft_freqs >= 3.0) & (fft_freqs <= 8.0)
+            gait_mask = (fft_freqs >= 0.5) & (fft_freqs <= 2.0)
+            tremor_mask = (fft_freqs >= 3.0) & (fft_freqs <= 8.0)
 
-    gait_power = np.sum(fft_vals[gait_mask]**2) if np.any(gait_mask) else 0.0
-    tremor_power = np.sum(fft_vals[tremor_mask]**2) if np.any(tremor_mask) else 0.0
+            gait_power = float(np.sum(fft_vals[gait_mask]**2)) if np.any(gait_mask) else 0.0
+            tremor_power = float(np.sum(fft_vals[tremor_mask]**2)) if np.any(tremor_mask) else 0.0
+            tremor_ratio = tremor_power / (gait_power + 1e-5)
+        else:
+            gait_power, tremor_power, tremor_ratio = 0.0, 0.0, 0.0
+    else:
+        gait_power, tremor_power, tremor_ratio = 0.0, 0.0, 0.0
 
-    tremor_ratio = tremor_power / (gait_power + 1e-5)
     features.extend([gait_power, tremor_power, tremor_ratio])
 
     # 6. Global Gait Speed & Cadence
-    root_vel = np.diff(joints[:, 0, :], axis=0) / dt
-    root_speed = np.linalg.norm(root_vel, axis=1)
+    if T > 1:
+        root_vel = np.diff(joints[:, 0, :], axis=0) / dt
+        root_speed = np.linalg.norm(root_vel, axis=1)
+        root_mean, root_std, root_max = float(np.mean(root_speed)), float(np.std(root_speed)), float(np.max(root_speed))
+    else:
+        root_mean, root_std, root_max = 0.0, 0.0, 0.0
 
-    features.extend([np.mean(root_speed), np.std(root_speed), np.max(root_speed)])
+    features.extend([root_mean, root_std, root_max])
 
     return np.array(features, dtype=np.float32)
