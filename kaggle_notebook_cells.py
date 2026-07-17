@@ -193,6 +193,8 @@ sys.path.remove(str(CAREPD_DIR))
 
 # Temporarily insert BASELINE_DIR to initialize preprocess model which pulls from data.preprocessing
 sys.path.insert(0, str(BASELINE_DIR))
+from submission.clinical_gait_features import extract_clinical_gait_features
+
 preprocess = MotionPreprocessor(
     smpl_model_path=BASELINE_DIR / "weights" / "smpl" / "SMPL_NEUTRAL.pkl",
     normalization_dir=BASELINE_DIR / "weights" / "stats" / "pdgam",
@@ -217,7 +219,7 @@ for pkl_file in pkl_files:
             if label is None:
                 label = -1
                 
-            motion, length = preprocess(sample)
+            motion, joints, length = preprocess.extract_with_joints(sample)
             motion_tensor = torch.as_tensor(motion[None], dtype=torch.float32, device=device)
             
             with torch.no_grad():
@@ -228,8 +230,15 @@ for pkl_file in pkl_files:
                 momask_out = momask_model(motion_tensor)
                 if isinstance(momask_out, tuple): momask_out = momask_out[0]
                 momask_stats = extract_time_series_stats(momask_out) if momask_out.shape[-1] == 512 else extract_time_series_stats(momask_out.permute(0, 2, 1))
-                    
-            combined = torch.cat([raw_stats, baseline_emb, momask_stats]).cpu().numpy()
+                
+            clinical_feat = extract_clinical_gait_features(joints, fps=25.0)
+            combined = np.concatenate([
+                raw_stats.cpu().numpy(),
+                baseline_emb.cpu().numpy(),
+                momask_stats.cpu().numpy(),
+                clinical_feat
+            ])
+            
             row = {'subject_id': subject_id, 'walk_id': walk_id, 'label': label, 'site': site_name}
             for i, v in enumerate(combined): row[f'f_{i}'] = v
             records.append(row)
@@ -243,19 +252,18 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Training MLP Classifier ---")
+print("--- 3. Training & Evaluating Classifier ---")
+from sklearn.linear_model import Ridge, LogisticRegression
+from scipy.optimize import minimize
 from sklearn.metrics import f1_score
-from sklearn.model_selection import GroupKFold
-from torch.utils.data import DataLoader, TensorDataset
 
-# Split into supervised
+# Split into supervised data
 df_sup = df[df['label'] != -1].copy()
 X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label', 'site']).values
 y_sup = df_sup['label'].values.astype(int)
 sites_sup = df_sup['site'].values
-groups_sup = df_sup['subject_id'].values
 
-# 1. Variance filter
+# 1. Variance Filter
 variances = np.var(X_sup, axis=0)
 valid_features_idx = np.where(variances > 1e-4)[0]
 print(f"Filtering features: kept {len(valid_features_idx)} out of {X_sup.shape[1]} features.")
@@ -263,93 +271,128 @@ X_sup = X_sup[:, valid_features_idx]
 
 # 2. Global StandardScaler
 scaler_mean = np.mean(X_sup, axis=0)
-scaler_std  = np.std(X_sup, axis=0) + 1e-2
-X_scaled = ((X_sup - scaler_mean) / scaler_std).astype(np.float32)
+scaler_std = np.std(X_sup, axis=0) + 1e-2
+X_scaled = (X_sup - scaler_mean) / scaler_std
 
-# 3. MLP definition
-class SeverityMLP(nn.Module):
-    def __init__(self, D, C=4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(D, 1024), nn.LayerNorm(1024), nn.GELU(), nn.Dropout(0.45),
-            nn.Linear(1024, 256), nn.LayerNorm(256),  nn.GELU(), nn.Dropout(0.35),
-            nn.Linear(256, 64),  nn.LayerNorm(64),   nn.GELU(), nn.Dropout(0.25),
-            nn.Linear(64, C),
-        )
-    def forward(self, x): return self.net(x)
+# Threshold optimization helper for Ordinal Regression
+def optimize_thresholds(y_true, y_pred_cont):
+    def loss(thresholds):
+        t0, t1, t2 = thresholds
+        if t0 >= t1 or t1 >= t2:
+            return 1e5
+        preds = np.zeros_like(y_pred_cont)
+        preds[y_pred_cont >= t0] = 1
+        preds[y_pred_cont >= t1] = 2
+        preds[y_pred_cont >= t2] = 3
+        return -f1_score(y_true, preds, average='macro', zero_division=0)
 
-# 4. Class weights
-class_counts = np.bincount(y_sup)
-cw = torch.tensor(len(y_sup) / (4.0 * class_counts), dtype=torch.float32).to(device)
+    res = minimize(loss, [0.5, 1.5, 2.5], method='Nelder-Mead', options={'maxiter': 500})
+    return res.x
 
-# 5. LOGO-CV using MLP (quick check)
-print("\nRunning LOGO-CV with MLP...")
-logo_scores = []
-for val_site in np.unique(sites_sup):
-    tr = sites_sup != val_site
-    va = sites_sup == val_site
-    X_tr = torch.tensor(X_scaled[tr]); y_tr = torch.tensor(y_sup[tr], dtype=torch.long)
-    X_va = torch.tensor(X_scaled[va]); y_va = y_sup[va]
+def apply_thresholds(y_pred_cont, thresholds):
+    t0, t1, t2 = thresholds
+    preds = np.zeros_like(y_pred_cont, dtype=int)
+    preds[y_pred_cont >= t0] = 1
+    preds[y_pred_cont >= t1] = 2
+    preds[y_pred_cont >= t2] = 3
+    return preds
 
-    loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=128, shuffle=True)
-    mlp_cv = SeverityMLP(X_scaled.shape[1]).to(device)
-    opt_cv = torch.optim.AdamW(mlp_cv.parameters(), lr=3e-4, weight_decay=1e-4)
-    sched_cv = torch.optim.lr_scheduler.CosineAnnealingLR(opt_cv, T_max=80)
-    crit = nn.CrossEntropyLoss(weight=cw)
+# 3. LOGO-CV Search across regularized models
+print("\nRunning Leave-One-Site-Out (LOGO) Cross-Validation Search...")
+unique_sites = np.unique(sites_sup)
 
-    for ep in range(80):
-        mlp_cv.train()
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            opt_cv.zero_grad()
-            crit(mlp_cv(xb), yb).backward()
-            opt_cv.step()
-        sched_cv.step()
+models_to_test = [
+    ("Ridge (alpha=1.0)", "ridge", 1.0),
+    ("Ridge (alpha=10.0)", "ridge", 10.0),
+    ("Ridge (alpha=100.0)", "ridge", 100.0),
+    ("LogisticRegression (C=0.01)", "logistic", 0.01),
+    ("LogisticRegression (C=0.1)", "logistic", 0.1),
+    ("LogisticRegression (C=1.0)", "logistic", 1.0),
+]
 
-    mlp_cv.eval()
-    with torch.no_grad():
-        preds = mlp_cv(X_va.to(device)).argmax(1).cpu().numpy()
-    s = f1_score(y_va, preds, average='macro', zero_division=0)
-    logo_scores.append(s)
-    print(f"  Site left out: {val_site:12s} | F1 = {s:.4f}")
-print(f"Mean LOGO F1 (MLP) = {np.mean(logo_scores):.4f}")
+best_score = -1.0
+best_model_name = ""
+best_model_type = ""
+best_param = 0.0
 
-# 6. Train final MLP on ALL supervised data (more epochs, full data)
-print("\nTraining final MLP on all supervised data (150 epochs)...")
-X_all = torch.tensor(X_scaled); y_all = torch.tensor(y_sup, dtype=torch.long)
-loader_full = DataLoader(TensorDataset(X_all, y_all), batch_size=128, shuffle=True)
+for name, mtype, param in models_to_test:
+    logo_scores = []
+    for val_site in unique_sites:
+        tr = sites_sup != val_site
+        va = sites_sup == val_site
+        X_tr, y_tr = X_scaled[tr], y_sup[tr]
+        X_va, y_va = X_scaled[va], y_sup[va]
+        
+        if mtype == "ridge":
+            class_counts = np.bincount(y_tr, minlength=4)
+            cw = len(y_tr) / (4.0 * np.where(class_counts == 0, 1, class_counts))
+            sw = cw[y_tr]
+            
+            clf = Ridge(alpha=param)
+            clf.fit(X_tr, y_tr, sample_weight=sw)
+            t = optimize_thresholds(y_tr, clf.predict(X_tr))
+            preds = apply_thresholds(clf.predict(X_va), t)
+        else:
+            clf = LogisticRegression(C=param, class_weight='balanced', max_iter=2000, solver='lbfgs')
+            clf.fit(X_tr, y_tr)
+            preds = clf.predict(X_va)
+            
+        s = f1_score(y_va, preds, average='macro', zero_division=0)
+        logo_scores.append(s)
+        
+    mean_s = np.mean(logo_scores)
+    print(f"Model: {name:28s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
+    if mean_s > best_score:
+        best_score = mean_s
+        best_model_name = name
+        best_model_type = mtype
+        best_param = param
 
-mlp_final = SeverityMLP(X_scaled.shape[1]).to(device)
-opt_f  = torch.optim.AdamW(mlp_final.parameters(), lr=3e-4, weight_decay=1e-4)
-sched_f = torch.optim.lr_scheduler.CosineAnnealingLR(opt_f, T_max=150)
-crit = nn.CrossEntropyLoss(weight=cw)
+print(f"\nWinning Model: {best_model_name} with Mean LOGO F1 = {best_score:.4f}")
 
-for ep in range(150):
-    mlp_final.train()
-    for xb, yb in loader_full:
-        xb, yb = xb.to(device), yb.to(device)
-        opt_f.zero_grad()
-        crit(mlp_final(xb), yb).backward()
-        opt_f.step()
-    sched_f.step()
+# 4. Train final model on ALL supervised data
+print("\nTraining final model on all supervised data...")
+thresholds = np.array([0.5, 1.5, 2.5])
+model_flag = 0
 
-mlp_final.eval()
-with torch.no_grad():
-    train_preds = mlp_final(X_all.to(device)).argmax(1).cpu().numpy()
+if best_model_type == "ridge":
+    model_flag = 1
+    class_counts = np.bincount(y_sup, minlength=4)
+    cw = len(y_sup) / (4.0 * np.where(class_counts == 0, 1, class_counts))
+    sw = cw[y_sup]
+    
+    clf = Ridge(alpha=best_param)
+    clf.fit(X_scaled, y_sup, sample_weight=sw)
+    train_pred_cont = clf.predict(X_scaled)
+    thresholds = optimize_thresholds(y_sup, train_pred_cont)
+    train_preds = apply_thresholds(train_pred_cont, thresholds)
+    
+    np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
+    np.save(REPO_DIR / "fusion_intercept.npy", np.array([clf.intercept_]))
+else:
+    model_flag = 0
+    clf = LogisticRegression(C=best_param, class_weight='balanced', max_iter=2000, solver='lbfgs')
+    clf.fit(X_scaled, y_sup)
+    train_preds = clf.predict(X_scaled)
+    
+    np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
+    np.save(REPO_DIR / "fusion_intercept.npy", clf.intercept_)
+
 train_f1 = f1_score(y_sup, train_preds, average='macro', zero_division=0)
 print(f"Train Macro F1 = {train_f1:.4f}")
 
-# 7. Save
+# Save model parameters
 np.save(REPO_DIR / "valid_features.npy", valid_features_idx)
 np.save(REPO_DIR / "scaler_mean.npy", scaler_mean)
 np.save(REPO_DIR / "scaler_std.npy", scaler_std)
-torch.save(mlp_final.state_dict(), REPO_DIR / "mlp_classifier.pth")
-print("Saved MLP model and scaler!")
+np.save(REPO_DIR / "model_type.npy", np.array([model_flag]))
+np.save(REPO_DIR / "thresholds.npy", thresholds)
+print("Saved final model parameters!")
 
 print("--- 4. Packaging Submission ---")
-for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy"]:
+for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy",
+              "fusion_coef.npy", "fusion_intercept.npy", "model_type.npy", "thresholds.npy"]:
     shutil.copy2(REPO_DIR / fname, BASELINE_DIR / "weights" / fname)
-shutil.copy2(REPO_DIR / "mlp_classifier.pth", BASELINE_DIR / "weights" / "mlp_classifier.pth")
 
 momask_dest = BASELINE_DIR / "weights" / "momask"
 momask_dest.mkdir(parents=True, exist_ok=True)

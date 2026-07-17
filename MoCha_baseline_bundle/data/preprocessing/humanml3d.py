@@ -56,6 +56,10 @@ class HumanML3DConverter:
         self.tgt_offsets = tgt_skel.get_offsets_joints(example_data[0])
 
     def __call__(self, sample: Mapping[str, object]) -> np.ndarray:
+        data, _ = self.convert_with_joints(sample)
+        return data
+
+    def convert_with_joints(self, sample: Mapping[str, object]) -> tuple[np.ndarray, np.ndarray]:
         joints = self.smpl_to_joints(sample)
         if self.cfg.apply_slope_correction:
             joints = transform_seq_so_it_has_no_slope_AMASS(joints)
@@ -72,7 +76,7 @@ class HumanML3DConverter:
             self.n_raw_offsets,
             self.kinematic_chain,
         )
-        return data.astype(np.float32)
+        return data.astype(np.float32), joints.astype(np.float32)
 
     def smpl_to_joints(self, sample: Mapping[str, object]) -> np.ndarray:
         pose = np.asarray(sample["pose"], dtype=np.float32)

@@ -76,8 +76,12 @@ class MotionPreprocessor:
         )
 
     def __call__(self, sample: Mapping[str, Any]) -> tuple[np.ndarray, int]:
+        motion, _, motion_len = self.extract_with_joints(sample)
+        return motion, motion_len
+
+    def extract_with_joints(self, sample: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, int]:
         sample = maybe_resample_sample(sample, self.target_fps)
-        humanml = self.converter(sample)
+        humanml, joints = self.converter.convert_with_joints(sample)
         humanml = humanml[:, :263]
 
         motion = ((humanml - self.mean[:263]) / self.std[:263]).astype(np.float32)
@@ -89,4 +93,4 @@ class MotionPreprocessor:
         elif motion.shape[0] > self.sequence_len:
             motion = motion[: self.sequence_len]
 
-        return motion.astype(np.float32), max(motion_len, 1)
+        return motion.astype(np.float32), joints.astype(np.float32), max(motion_len, 1)
