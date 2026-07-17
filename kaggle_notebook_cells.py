@@ -252,10 +252,12 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Feature Selection & Model Evaluation ---")
+print("--- 3. Domain Alignment, Feature Selection & Model Evaluation ---")
 from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.svm import SVC
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.ensemble import ExtraTreesClassifier
+import lightgbm as lgb
 from scipy.optimize import minimize
 from sklearn.metrics import f1_score
 
@@ -276,13 +278,18 @@ print(f"Filtering features: kept {len(valid_features_idx)} out of {num_total_fea
 
 # Map clinical indices in filtered space
 clinical_indices_filtered = [i for i, orig_idx in enumerate(valid_features_idx) if orig_idx in clinical_indices]
-
 X_sup_filtered = X_sup[:, valid_features_idx]
 
-# 2. Global StandardScaler
-scaler_mean = np.mean(X_sup_filtered, axis=0)
-scaler_std = np.std(X_sup_filtered, axis=0) + 1e-2
-X_scaled = (X_sup_filtered - scaler_mean) / scaler_std
+# 2. Site-Wise Mean Centering (to align site domains)
+X_site_centered = X_sup_filtered.copy()
+for s in np.unique(sites_sup):
+    mask = sites_sup == s
+    X_site_centered[mask] = X_site_centered[mask] - np.mean(X_site_centered[mask], axis=0)
+
+# Global StandardScaler on site-centered data
+scaler_mean = np.mean(X_site_centered, axis=0)
+scaler_std = np.std(X_site_centered, axis=0) + 1e-2
+X_scaled = (X_site_centered - scaler_mean) / scaler_std
 
 # Threshold optimization helper for Ordinal Regression
 def optimize_thresholds(y_true, y_pred_cont):
@@ -313,22 +320,23 @@ unique_sites = np.unique(sites_sup)
 
 configs = [
     # (Name, Feature_Mode, K_features, Model_Type, Hyperparam)
-    ("Clinical Features ONLY (Ridge alpha=10)", "clinical_only", 36, "ridge", 10.0),
-    ("Clinical Features ONLY (Ridge alpha=1.0)", "clinical_only", 36, "ridge", 1.0),
-    ("Clinical Features ONLY (Logistic C=0.1)", "clinical_only", 36, "logistic", 0.1),
-    ("Clinical Features ONLY (ExtraTrees n=100)", "clinical_only", 36, "extratrees", 100),
-    ("Top 32 ANOVA Features (Ridge alpha=10)", "top_k", 32, "ridge", 10.0),
-    ("Top 64 ANOVA Features (Ridge alpha=10)", "top_k", 64, "ridge", 10.0),
-    ("Top 128 ANOVA Features (Ridge alpha=10)", "top_k", 128, "ridge", 10.0),
-    ("Clinical + Top 32 ANOVA (Ridge alpha=10)", "clinical_plus_k", 32, "ridge", 10.0),
-    ("Clinical + Top 64 ANOVA (Ridge alpha=10)", "clinical_plus_k", 64, "ridge", 10.0),
-    ("Clinical + Top 128 ANOVA (Ridge alpha=10)", "clinical_plus_k", 128, "ridge", 10.0),
-    ("All Features (Ridge alpha=10)", "all", 0, "ridge", 10.0),
+    ("Top 128 ANOVA + Ridge (alpha=10)", "top_k", 128, "ridge", 10.0),
+    ("Top 256 ANOVA + Ridge (alpha=10)", "top_k", 256, "ridge", 10.0),
+    ("Top 256 ANOVA + Ridge (alpha=100)", "top_k", 256, "ridge", 100.0),
+    ("Top 512 ANOVA + Ridge (alpha=100)", "top_k", 512, "ridge", 100.0),
+    ("Top 128 ANOVA + LightGBM (depth=3)", "top_k", 128, "lgb", 3),
+    ("Top 256 ANOVA + LightGBM (depth=3)", "top_k", 256, "lgb", 3),
+    ("Top 256 ANOVA + LightGBM (depth=4)", "top_k", 256, "lgb", 4),
+    ("Top 256 ANOVA + SVC (RBF C=1.0)", "top_k", 256, "svc", 1.0),
+    ("Top 256 ANOVA + SVC (RBF C=10.0)", "top_k", 256, "svc", 10.0),
+    ("Clinical + Top 128 ANOVA + Ridge (alpha=10)", "clinical_plus_k", 128, "ridge", 10.0),
+    ("Clinical + Top 256 ANOVA + Ridge (alpha=10)", "clinical_plus_k", 256, "ridge", 10.0),
+    ("Clinical + Top 256 ANOVA + LightGBM (depth=3)", "clinical_plus_k", 256, "lgb", 3),
+    ("Clinical + Top 256 ANOVA + SVC (RBF C=1.0)", "clinical_plus_k", 256, "svc", 1.0),
 ]
 
 best_score = -1.0
 best_config = None
-best_selected_sub_indices = None
 
 for name, feat_mode, k_feat, mtype, param in configs:
     logo_scores = []
@@ -371,6 +379,21 @@ for name, feat_mode, k_feat, mtype, param in configs:
             clf = LogisticRegression(C=param, class_weight='balanced', max_iter=2000, solver='lbfgs')
             clf.fit(X_tr, y_tr)
             preds = clf.predict(X_va)
+        elif mtype == "svc":
+            clf = SVC(C=param, kernel='rbf', class_weight='balanced', random_state=42)
+            clf.fit(X_tr, y_tr)
+            preds = clf.predict(X_va)
+        elif mtype == "lgb":
+            clf = lgb.LGBMClassifier(
+                max_depth=int(param),
+                n_estimators=100,
+                learning_rate=0.03,
+                class_weight='balanced',
+                random_state=42,
+                verbosity=-1
+            )
+            clf.fit(X_tr, y_tr)
+            preds = clf.predict(X_va)
         elif mtype == "extratrees":
             clf = ExtraTreesClassifier(n_estimators=int(param), max_depth=6, class_weight='balanced', random_state=42)
             clf.fit(X_tr, y_tr)
@@ -380,7 +403,7 @@ for name, feat_mode, k_feat, mtype, param in configs:
         logo_scores.append(s)
         
     mean_s = np.mean(logo_scores)
-    print(f"Config: {name:42s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
+    print(f"Config: {name:46s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
     if mean_s > best_score:
         best_score = mean_s
         best_config = (name, feat_mode, k_feat, mtype, param)
@@ -435,8 +458,8 @@ elif mtype == "logistic":
     
     np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
     np.save(REPO_DIR / "fusion_intercept.npy", clf.intercept_)
-elif mtype == "extratrees":
-    # ExtraTrees is ensemble tree model, save tree predictions or fall back to linear fit for submission bundle
+else:
+    # Non-linear model (LightGBM/SVC): fit linear surrogate for fast PyTorch-free inference in baseline_model.py
     model_flag = 0
     clf = LogisticRegression(C=1.0, class_weight='balanced', max_iter=2000, solver='lbfgs')
     clf.fit(X_final_input, y_sup)
