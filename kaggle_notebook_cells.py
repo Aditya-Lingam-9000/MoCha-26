@@ -290,12 +290,13 @@ for s in np.unique(sites_sup):
     mask = sites_sup == s
     X_site_centered[mask] = X_site_centered[mask] - np.mean(X_site_centered[mask], axis=0)
 
-# Ensemble Soft-Voting Classifier Helper
-def build_ensemble(weights=None):
+# Ensemble Soft-Voting Classifier Helper (4 Diverse Classifiers)
+def build_ensemble(weights=[2.0, 1.0, 1.0, 1.0]):
     m1 = SVC(C=1.5, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
-    m2 = ExtraTreesClassifier(n_estimators=150, class_weight='balanced', max_depth=8, random_state=42)
-    m3 = lgb.LGBMClassifier(max_depth=4, n_estimators=150, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
-    return VotingClassifier(estimators=[('svc', m1), ('et', m2), ('lgb', m3)], voting='soft', weights=weights)
+    m2 = ExtraTreesClassifier(n_estimators=200, class_weight='balanced', max_depth=10, random_state=42)
+    m3 = lgb.LGBMClassifier(max_depth=4, n_estimators=200, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
+    m4 = LogisticRegression(C=0.1, class_weight='balanced', max_iter=2000, solver='lbfgs')
+    return VotingClassifier(estimators=[('svc', m1), ('et', m2), ('lgb', m3), ('lr', m4)], voting='soft', weights=weights)
 
 # 3. Model Search under GroupKFold & LOGO-CV
 print("\n--- Running Multi-Metric Feature & Model Search ---")
@@ -303,12 +304,12 @@ unique_sites = np.unique(sites_sup)
 gkf = GroupKFold(n_splits=5)
 
 configs = [
-    ("Quantile + MutualInfo 256 + Soft Ensemble (SVC+ET+LGB)", "quantile", "mi", 256, build_ensemble()),
-    ("Quantile + ExtraTrees 256 + Soft Ensemble (SVC+ET+LGB)", "quantile", "et", 256, build_ensemble()),
-    ("StandardScaler + ExtraTrees 256 + Soft Ensemble (SVC+ET+LGB)", "standard", "et", 256, build_ensemble()),
-    ("Quantile + Clinical + Top 256 MI + Soft Ensemble", "quantile", "clinical_mi", 256, build_ensemble()),
-    ("Quantile + Top 256 ANOVA + Soft Ensemble (SVC+ET+LGB)", "quantile", "anova", 256, build_ensemble()),
-    ("StandardScaler + Top 256 ANOVA + SVC (RBF C=1.5)", "standard", "anova", 256, SVC(C=1.5, kernel='rbf', class_weight='balanced', random_state=42)),
+    ("Quantile + MutualInfo 512 + 4-Model Soft Ensemble", "quantile", "mi", 512, build_ensemble([2.0, 1.0, 1.0, 1.0])),
+    ("Quantile + MutualInfo 384 + 4-Model Soft Ensemble", "quantile", "mi", 384, build_ensemble([2.0, 1.0, 1.0, 1.0])),
+    ("Quantile + MutualInfo 256 + 4-Model Soft Ensemble", "quantile", "mi", 256, build_ensemble([2.0, 1.0, 1.0, 1.0])),
+    ("Quantile + MutualInfo 768 + 4-Model Soft Ensemble", "quantile", "mi", 768, build_ensemble([2.0, 1.0, 1.0, 1.0])),
+    ("Quantile + Clinical + Top 384 MI + 4-Model Soft Ensemble", "quantile", "clinical_mi", 384, build_ensemble([2.0, 1.0, 1.0, 1.0])),
+    ("StandardScaler + MutualInfo 384 + 4-Model Soft Ensemble", "standard", "mi", 384, build_ensemble([2.0, 1.0, 1.0, 1.0])),
 ]
 
 best_score = -1.0
@@ -494,6 +495,3 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(file_path, arcname)
 
 print(f"Kaggle Pipeline Complete! Download {zip_path} from the Kaggle Output section and submit to CodaBench!")
-
-
-
