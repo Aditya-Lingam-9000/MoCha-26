@@ -252,13 +252,13 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Ensemble Modeling, GroupKFold & LOGO-CV Evaluation ---")
+print("--- 3. Advanced Feature Selection & Ensemble Search ---")
 import joblib
 from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.svm import SVC, SVR
-from sklearn.ensemble import VotingClassifier, ExtraTreesClassifier
-from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.ensemble import VotingClassifier, ExtraTreesClassifier, RandomForestClassifier
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif, SelectFromModel
 from sklearn.model_selection import GroupKFold
 import lightgbm as lgb
 from scipy.optimize import minimize
@@ -290,69 +290,25 @@ for s in np.unique(sites_sup):
     mask = sites_sup == s
     X_site_centered[mask] = X_site_centered[mask] - np.mean(X_site_centered[mask], axis=0)
 
-# Threshold optimization helper for Ordinal Regression
-def optimize_thresholds(y_true, y_pred_cont):
-    def loss(thresholds):
-        t0, t1, t2 = thresholds
-        if t0 >= t1 or t1 >= t2:
-            return 1e5
-        preds = np.zeros_like(y_pred_cont)
-        preds[y_pred_cont >= t0] = 1
-        preds[y_pred_cont >= t1] = 2
-        preds[y_pred_cont >= t2] = 3
-        return -f1_score(y_true, preds, average='macro', zero_division=0)
+# Ensemble Soft-Voting Classifier Helper
+def build_ensemble(weights=None):
+    m1 = SVC(C=1.5, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
+    m2 = ExtraTreesClassifier(n_estimators=150, class_weight='balanced', max_depth=8, random_state=42)
+    m3 = lgb.LGBMClassifier(max_depth=4, n_estimators=150, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
+    return VotingClassifier(estimators=[('svc', m1), ('et', m2), ('lgb', m3)], voting='soft', weights=weights)
 
-    res = minimize(loss, [0.5, 1.5, 2.5], method='Nelder-Mead', options={'maxiter': 500})
-    return res.x
-
-def apply_thresholds(y_pred_cont, thresholds):
-    t0, t1, t2 = thresholds
-    preds = np.zeros_like(y_pred_cont, dtype=int)
-    preds[y_pred_cont >= t0] = 1
-    preds[y_pred_cont >= t1] = 2
-    preds[y_pred_cont >= t2] = 3
-    return preds
-
-# Wrapper for Ordinal SVR (RBF Kernel)
-class OrdinalSVRClassifier:
-    def __init__(self, C=1.0, gamma='scale', epsilon=0.1):
-        self.C = C
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.model = SVR(C=C, gamma=gamma, epsilon=epsilon, kernel='rbf')
-        self.thresholds = np.array([0.5, 1.5, 2.5])
-        
-    def fit(self, X, y):
-        class_counts = np.bincount(y, minlength=4)
-        cw = len(y) / (4.0 * np.where(class_counts == 0, 1, class_counts))
-        sw = cw[y]
-        self.model.fit(X, y, sample_weight=sw)
-        pred_cont = self.model.predict(X)
-        self.thresholds = optimize_thresholds(y, pred_cont)
-        return self
-
-    def predict(self, X):
-        pred_cont = self.model.predict(X)
-        return apply_thresholds(pred_cont, self.thresholds)
-
-# Ensemble Soft-Voting Classifier
-def build_ensemble():
-    m1 = SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
-    m2 = LogisticRegression(C=0.1, class_weight='balanced', max_iter=2000, solver='lbfgs')
-    m3 = lgb.LGBMClassifier(max_depth=3, n_estimators=100, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
-    return VotingClassifier(estimators=[('svc', m1), ('lr', m2), ('lgb', m3)], voting='soft')
-
-# 3. Model Search under LOGO-CV and GroupKFold
-print("\n--- Running Cross-Validation Search ---")
+# 3. Model Search under GroupKFold & LOGO-CV
+print("\n--- Running Multi-Metric Feature & Model Search ---")
 unique_sites = np.unique(sites_sup)
 gkf = GroupKFold(n_splits=5)
 
 configs = [
-    ("StandardScaler + Top 256 ANOVA + Soft Ensemble (SVC+LR+LGB)", "standard", "top_k", 256, build_ensemble()),
-    ("StandardScaler + Top 128 ANOVA + Soft Ensemble (SVC+LR+LGB)", "standard", "top_k", 128, build_ensemble()),
-    ("StandardScaler + Top 256 ANOVA + SVC (RBF C=1.0)", "standard", "top_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("StandardScaler + Top 256 ANOVA + Ordinal SVR (C=1.0)", "standard", "top_k", 256, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
-    ("Quantile + Top 256 ANOVA + Soft Ensemble (SVC+LR+LGB)", "quantile", "top_k", 256, build_ensemble()),
+    ("Quantile + MutualInfo 256 + Soft Ensemble (SVC+ET+LGB)", "quantile", "mi", 256, build_ensemble()),
+    ("Quantile + ExtraTrees 256 + Soft Ensemble (SVC+ET+LGB)", "quantile", "et", 256, build_ensemble()),
+    ("StandardScaler + ExtraTrees 256 + Soft Ensemble (SVC+ET+LGB)", "standard", "et", 256, build_ensemble()),
+    ("Quantile + Clinical + Top 256 MI + Soft Ensemble", "quantile", "clinical_mi", 256, build_ensemble()),
+    ("Quantile + Top 256 ANOVA + Soft Ensemble (SVC+ET+LGB)", "quantile", "anova", 256, build_ensemble()),
+    ("StandardScaler + Top 256 ANOVA + SVC (RBF C=1.5)", "standard", "anova", 256, SVC(C=1.5, kernel='rbf', class_weight='balanced', random_state=42)),
 ]
 
 best_score = -1.0
@@ -379,9 +335,27 @@ for name, stype, feat_mode, k_feat, model_template in configs:
         X_tr_scaled = scaler.fit_transform(X_tr_raw)
         X_va_scaled = scaler.transform(X_va_raw)
         
-        selector = SelectKBest(f_classif, k=k_feat)
-        selector.fit(X_tr_scaled, y_tr)
-        sub_idx = selector.get_support(indices=True)
+        if feat_mode == "anova":
+            selector = SelectKBest(f_classif, k=k_feat)
+            selector.fit(X_tr_scaled, y_tr)
+            sub_idx = selector.get_support(indices=True)
+        elif feat_mode == "mi":
+            selector = SelectKBest(mutual_info_classif, k=k_feat)
+            selector.fit(X_tr_scaled, y_tr)
+            sub_idx = selector.get_support(indices=True)
+        elif feat_mode == "et":
+            et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
+            et_sel.fit(X_tr_scaled, y_tr)
+            importances = et_sel.feature_importances_
+            sub_idx = np.argsort(importances)[-k_feat:]
+        elif feat_mode == "clinical_mi":
+            non_clinical = [i for i in range(X_tr_scaled.shape[1]) if i not in clinical_indices_filtered]
+            selector = SelectKBest(mutual_info_classif, k=k_feat)
+            selector.fit(X_tr_scaled[:, non_clinical], y_tr)
+            selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
+            sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
+        else:
+            sub_idx = list(range(X_tr_scaled.shape[1]))
             
         X_tr = X_tr_scaled[:, sub_idx]
         X_va = X_va_scaled[:, sub_idx]
@@ -406,9 +380,27 @@ for name, stype, feat_mode, k_feat, model_template in configs:
         X_tr_scaled = scaler.fit_transform(X_tr_raw)
         X_va_scaled = scaler.transform(X_va_raw)
         
-        selector = SelectKBest(f_classif, k=k_feat)
-        selector.fit(X_tr_scaled, y_tr)
-        sub_idx = selector.get_support(indices=True)
+        if feat_mode == "anova":
+            selector = SelectKBest(f_classif, k=k_feat)
+            selector.fit(X_tr_scaled, y_tr)
+            sub_idx = selector.get_support(indices=True)
+        elif feat_mode == "mi":
+            selector = SelectKBest(mutual_info_classif, k=k_feat)
+            selector.fit(X_tr_scaled, y_tr)
+            sub_idx = selector.get_support(indices=True)
+        elif feat_mode == "et":
+            et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
+            et_sel.fit(X_tr_scaled, y_tr)
+            importances = et_sel.feature_importances_
+            sub_idx = np.argsort(importances)[-k_feat:]
+        elif feat_mode == "clinical_mi":
+            non_clinical = [i for i in range(X_tr_scaled.shape[1]) if i not in clinical_indices_filtered]
+            selector = SelectKBest(mutual_info_classif, k=k_feat)
+            selector.fit(X_tr_scaled[:, non_clinical], y_tr)
+            selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
+            sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
+        else:
+            sub_idx = list(range(X_tr_scaled.shape[1]))
             
         X_tr = X_tr_scaled[:, sub_idx]
         X_va = X_va_scaled[:, sub_idx]
@@ -422,11 +414,13 @@ for name, stype, feat_mode, k_feat, model_template in configs:
     mean_logo = np.mean(logo_scores)
     mean_gkf = np.mean(gkf_scores)
     print(f"Config: {name:58s} | LOGO F1 = {mean_logo:.4f} | Subject GroupKFold F1 = {mean_gkf:.4f}")
-    if mean_logo > best_score:
-        best_score = mean_logo
+    
+    # Select based on Subject GroupKFold F1 since CodaBench evaluates all subjects together
+    if mean_gkf > best_score:
+        best_score = mean_gkf
         best_config = (name, stype, feat_mode, k_feat, model_template)
 
-print(f"\nWinning Config: {best_config[0]} with Mean LOGO F1 = {best_score:.4f}")
+print(f"\nWinning Config: {best_config[0]} with Subject GroupKFold F1 = {best_score:.4f}")
 
 # 4. Train final model on ALL supervised data using winning config
 name, stype, feat_mode, k_feat, model_template = best_config
@@ -438,9 +432,27 @@ else:
 
 X_scaled_final = final_scaler.fit_transform(X_site_centered)
 
-selector = SelectKBest(f_classif, k=k_feat)
-selector.fit(X_scaled_final, y_sup)
-final_sub_idx = selector.get_support(indices=True)
+if feat_mode == "anova":
+    selector = SelectKBest(f_classif, k=k_feat)
+    selector.fit(X_scaled_final, y_sup)
+    final_sub_idx = selector.get_support(indices=True)
+elif feat_mode == "mi":
+    selector = SelectKBest(mutual_info_classif, k=k_feat)
+    selector.fit(X_scaled_final, y_sup)
+    final_sub_idx = selector.get_support(indices=True)
+elif feat_mode == "et":
+    et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
+    et_sel.fit(X_scaled_final, y_sup)
+    importances = et_sel.feature_importances_
+    final_sub_idx = np.argsort(importances)[-k_feat:]
+elif feat_mode == "clinical_mi":
+    non_clinical = [i for i in range(X_scaled_final.shape[1]) if i not in clinical_indices_filtered]
+    selector = SelectKBest(mutual_info_classif, k=k_feat)
+    selector.fit(X_scaled_final[:, non_clinical], y_sup)
+    selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
+    final_sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
+else:
+    final_sub_idx = list(range(X_scaled_final.shape[1]))
 
 final_valid_features_idx = valid_features_idx[final_sub_idx]
 X_final_input = X_scaled_final[:, final_sub_idx]
