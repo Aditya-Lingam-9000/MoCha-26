@@ -269,7 +269,7 @@ df_sup = df[df['label'] != -1].copy()
 X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label', 'site']).values
 y_sup = df_sup['label'].values.astype(int)
 sites_sup = df_sup['site'].values
-subjects_sup = df_sup['subject_id'].values
+subjects_sup = df_sup['subject_id'].astype(str).values
 
 num_total_features = X_sup.shape[1]
 num_clinical = 36
