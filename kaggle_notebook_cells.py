@@ -426,37 +426,37 @@ print(f"\nWinning Config: {best_config[0]} with Subject GroupKFold F1 = {best_sc
 # 4. Train final model on ALL supervised data using winning config
 name, stype, feat_mode, k_feat, model_template = best_config
 
+if feat_mode == "anova":
+    selector = SelectKBest(f_classif, k=k_feat)
+    selector.fit(X_site_centered, y_sup)
+    final_sub_idx = selector.get_support(indices=True)
+elif feat_mode == "mi":
+    selector = SelectKBest(mutual_info_classif, k=k_feat)
+    selector.fit(X_site_centered, y_sup)
+    final_sub_idx = selector.get_support(indices=True)
+elif feat_mode == "et":
+    et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
+    et_sel.fit(X_site_centered, y_sup)
+    importances = et_sel.feature_importances_
+    final_sub_idx = np.argsort(importances)[-k_feat:]
+elif feat_mode == "clinical_mi":
+    non_clinical = [i for i in range(X_site_centered.shape[1]) if i not in clinical_indices_filtered]
+    selector = SelectKBest(mutual_info_classif, k=k_feat)
+    selector.fit(X_site_centered[:, non_clinical], y_sup)
+    selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
+    final_sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
+else:
+    final_sub_idx = list(range(X_site_centered.shape[1]))
+
+final_valid_features_idx = valid_features_idx[final_sub_idx]
+X_selected_unscaled = X_site_centered[:, final_sub_idx]
+
 if stype == "quantile":
     final_scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(y_sup), 1000))
 else:
     final_scaler = StandardScaler()
 
-X_scaled_final = final_scaler.fit_transform(X_site_centered)
-
-if feat_mode == "anova":
-    selector = SelectKBest(f_classif, k=k_feat)
-    selector.fit(X_scaled_final, y_sup)
-    final_sub_idx = selector.get_support(indices=True)
-elif feat_mode == "mi":
-    selector = SelectKBest(mutual_info_classif, k=k_feat)
-    selector.fit(X_scaled_final, y_sup)
-    final_sub_idx = selector.get_support(indices=True)
-elif feat_mode == "et":
-    et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
-    et_sel.fit(X_scaled_final, y_sup)
-    importances = et_sel.feature_importances_
-    final_sub_idx = np.argsort(importances)[-k_feat:]
-elif feat_mode == "clinical_mi":
-    non_clinical = [i for i in range(X_scaled_final.shape[1]) if i not in clinical_indices_filtered]
-    selector = SelectKBest(mutual_info_classif, k=k_feat)
-    selector.fit(X_scaled_final[:, non_clinical], y_sup)
-    selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
-    final_sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
-else:
-    final_sub_idx = list(range(X_scaled_final.shape[1]))
-
-final_valid_features_idx = valid_features_idx[final_sub_idx]
-X_final_input = X_scaled_final[:, final_sub_idx]
+X_final_input = final_scaler.fit_transform(X_selected_unscaled)
 
 final_clf = copy.deepcopy(model_template)
 final_clf.fit(X_final_input, y_sup)
