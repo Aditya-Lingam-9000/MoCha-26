@@ -208,6 +208,7 @@ sys.path.insert(0, str(BASELINE_DIR))
 sys.path.insert(0, str(CAREPD_DIR))
 
 for pkl_file in pkl_files:
+    site_name = pkl_file.name.split('_')[0]
     with open(pkl_file, "rb") as f:
         data = pickle.load(f)
     for subject_id, walks in tqdm(data.items(), desc=pkl_file.name):
@@ -229,7 +230,7 @@ for pkl_file in pkl_files:
                 momask_stats = extract_time_series_stats(momask_out) if momask_out.shape[-1] == 512 else extract_time_series_stats(momask_out.permute(0, 2, 1))
                     
             combined = torch.cat([raw_stats, baseline_emb, momask_stats]).cpu().numpy()
-            row = {'subject_id': subject_id, 'walk_id': walk_id, 'label': label}
+            row = {'subject_id': subject_id, 'walk_id': walk_id, 'label': label, 'site': site_name}
             for i, v in enumerate(combined): row[f'f_{i}'] = v
             records.append(row)
 
@@ -242,70 +243,68 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Semi-Supervised Domain Adaptation ---")
+print("--- 3. Training Classifier ---")
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+from sklearn.model_selection import GroupKFold
 
+# Split into supervised and unsupervised
 df_sup = df[df['label'] != -1].copy()
 df_unsup = df[df['label'] == -1].copy()
 
-X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label']).values
-y_sup = df_sup['label'].values
-X_unsup = df_unsup.drop(columns=['subject_id', 'walk_id', 'label']).values
+X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label', 'site']).values
+y_sup = df_sup['label'].values.astype(int)
+sites_sup = df_sup['site'].values
+groups_sup = df_sup['subject_id'].values
 
-# 1. Filter out features with very low variance to prevent scale blowups on test set
+# 1. Variance filter — keep features with meaningful variation
 variances = np.var(X_sup, axis=0)
 valid_features_idx = np.where(variances > 1e-4)[0]
 print(f"Filtering features: kept {len(valid_features_idx)} out of {X_sup.shape[1]} features.")
-np.save(REPO_DIR / "valid_features.npy", valid_features_idx)
-
 X_sup = X_sup[:, valid_features_idx]
-X_unsup = X_unsup[:, valid_features_idx]
 
-# 2. Fit scaler on supervised, apply to both (using 1e-2 epsilon for safe division)
-X_mean = X_sup.mean(axis=0, keepdims=True)
-X_std = X_sup.std(axis=0, keepdims=True) + 1e-2
-X_sup_scaled = (X_sup - X_mean) / X_std
-X_unsup_scaled = (X_unsup - X_mean) / X_std
+# 2. Global StandardScaler fitted on ALL supervised training data
+scaler_mean = np.mean(X_sup, axis=0)
+scaler_std = np.std(X_sup, axis=0) + 1e-2
+X_scaled = (X_sup - scaler_mean) / scaler_std
 
-np.save(REPO_DIR / "fusion_scaler_mean.npy", X_mean)
-np.save(REPO_DIR / "fusion_scaler_std.npy", X_std)
+# 3. LOGO-CV to verify without wasting a submission
+print("\nRunning Leave-One-Site-Out (LOGO) Cross-Validation...")
+unique_sites = np.unique(sites_sup)
+logo_scores = []
+for val_site in unique_sites:
+    tr = sites_sup != val_site
+    va = sites_sup == val_site
+    X_tr, y_tr = X_scaled[tr], y_sup[tr]
+    X_va, y_va = X_scaled[va], y_sup[va]
+    clf_cv = LogisticRegression(C=0.1, class_weight='balanced', max_iter=5000, solver='saga', n_jobs=-1)
+    clf_cv.fit(X_tr, y_tr)
+    preds = clf_cv.predict(X_va)
+    s = f1_score(y_va, preds, average='macro', zero_division=0)
+    logo_scores.append(s)
+    print(f"  Site left out: {val_site:12s} | F1 = {s:.4f}")
+print(f"Mean LOGO F1 = {np.mean(logo_scores):.4f}")
 
-# 3. Train initial Logistic Regression model on supervised data
-print("Training initial Logistic Regression on supervised data...")
-clf = LogisticRegression(C=0.1, class_weight='balanced', max_iter=1000)
-clf.fit(X_sup_scaled, y_sup)
+# 4. Train final model on ALL supervised data
+print("\nTraining final model on all supervised data...")
+clf = LogisticRegression(C=0.1, class_weight='balanced', max_iter=5000, solver='saga', n_jobs=-1)
+clf.fit(X_scaled, y_sup)
 
-# 4. Generate Pseudo-Labels for Unsupervised Data
-print("Generating Pseudo-Labels for Unsupervised Data...")
-probs = clf.predict_proba(X_unsup_scaled)
-max_probs = np.max(probs, axis=1)
-pseudo_labels = np.argmax(probs, axis=1)
+train_f1 = f1_score(y_sup, clf.predict(X_scaled), average='macro', zero_division=0)
+print(f"Train Macro F1 = {train_f1:.4f}")
 
-confident_idx = max_probs > 0.90
-X_pseudo = X_unsup_scaled[confident_idx]
-y_pseudo = pseudo_labels[confident_idx]
-print(f"Kept {len(y_pseudo)} highly confident unsupervised samples!")
-
-# Combine supervised and pseudo-labeled data
-X_combined = np.vstack([X_sup_scaled, X_pseudo])
-y_combined = np.concatenate([y_sup, y_pseudo])
-
-# 5. Retrain on Combined Dataset
-print("Retraining Logistic Regression on Combined Dataset...")
-clf_final = LogisticRegression(C=0.1, class_weight='balanced', max_iter=1000)
-clf_final.fit(X_combined, y_combined)
-
-# Save final coefficients and intercepts
-np.save(REPO_DIR / "fusion_coef.npy", clf_final.coef_)
-np.save(REPO_DIR / "fusion_intercept.npy", clf_final.intercept_)
-print("Saved final domain-adapted model parameters!")
+# 5. Save everything
+np.save(REPO_DIR / "valid_features.npy", valid_features_idx)
+np.save(REPO_DIR / "scaler_mean.npy", scaler_mean)
+np.save(REPO_DIR / "scaler_std.npy", scaler_std)
+np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
+np.save(REPO_DIR / "fusion_intercept.npy", clf.intercept_)
+print("Saved model parameters!")
 
 print("--- 4. Packaging Submission ---")
-shutil.copy2(REPO_DIR / "valid_features.npy", BASELINE_DIR / "weights" / "valid_features.npy")
-shutil.copy2(REPO_DIR / "fusion_coef.npy", BASELINE_DIR / "weights" / "fusion_coef.npy")
-shutil.copy2(REPO_DIR / "fusion_intercept.npy", BASELINE_DIR / "weights" / "fusion_intercept.npy")
-shutil.copy2(REPO_DIR / "fusion_scaler_mean.npy", BASELINE_DIR / "weights" / "fusion_scaler_mean.npy")
-shutil.copy2(REPO_DIR / "fusion_scaler_std.npy", BASELINE_DIR / "weights" / "fusion_scaler_std.npy")
+for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy",
+              "fusion_coef.npy", "fusion_intercept.npy"]:
+    shutil.copy2(REPO_DIR / fname, BASELINE_DIR / "weights" / fname)
 
 momask_dest = BASELINE_DIR / "weights" / "momask"
 momask_dest.mkdir(parents=True, exist_ok=True)
@@ -326,3 +325,4 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zipf.write(file_path, arcname)
 
 print(f"Kaggle Pipeline Complete! Download {zip_path} from the Kaggle Output section and submit to CodaBench!")
+
