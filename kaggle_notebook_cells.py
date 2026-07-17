@@ -243,68 +243,113 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Training Classifier ---")
-from sklearn.linear_model import LogisticRegression
+print("--- 3. Training MLP Classifier ---")
 from sklearn.metrics import f1_score
 from sklearn.model_selection import GroupKFold
+from torch.utils.data import DataLoader, TensorDataset
 
-# Split into supervised and unsupervised
+# Split into supervised
 df_sup = df[df['label'] != -1].copy()
-df_unsup = df[df['label'] == -1].copy()
-
 X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label', 'site']).values
 y_sup = df_sup['label'].values.astype(int)
 sites_sup = df_sup['site'].values
 groups_sup = df_sup['subject_id'].values
 
-# 1. Variance filter — keep features with meaningful variation
+# 1. Variance filter
 variances = np.var(X_sup, axis=0)
 valid_features_idx = np.where(variances > 1e-4)[0]
 print(f"Filtering features: kept {len(valid_features_idx)} out of {X_sup.shape[1]} features.")
 X_sup = X_sup[:, valid_features_idx]
 
-# 2. Global StandardScaler fitted on ALL supervised training data
+# 2. Global StandardScaler
 scaler_mean = np.mean(X_sup, axis=0)
-scaler_std = np.std(X_sup, axis=0) + 1e-2
-X_scaled = (X_sup - scaler_mean) / scaler_std
+scaler_std  = np.std(X_sup, axis=0) + 1e-2
+X_scaled = ((X_sup - scaler_mean) / scaler_std).astype(np.float32)
 
-# 3. LOGO-CV to verify without wasting a submission
-print("\nRunning Leave-One-Site-Out (LOGO) Cross-Validation...")
-unique_sites = np.unique(sites_sup)
+# 3. MLP definition
+class SeverityMLP(nn.Module):
+    def __init__(self, D, C=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(D, 1024), nn.LayerNorm(1024), nn.GELU(), nn.Dropout(0.45),
+            nn.Linear(1024, 256), nn.LayerNorm(256),  nn.GELU(), nn.Dropout(0.35),
+            nn.Linear(256, 64),  nn.LayerNorm(64),   nn.GELU(), nn.Dropout(0.25),
+            nn.Linear(64, C),
+        )
+    def forward(self, x): return self.net(x)
+
+# 4. Class weights
+class_counts = np.bincount(y_sup)
+cw = torch.tensor(len(y_sup) / (4.0 * class_counts), dtype=torch.float32).to(device)
+
+# 5. LOGO-CV using MLP (quick check)
+print("\nRunning LOGO-CV with MLP...")
 logo_scores = []
-for val_site in unique_sites:
+for val_site in np.unique(sites_sup):
     tr = sites_sup != val_site
     va = sites_sup == val_site
-    X_tr, y_tr = X_scaled[tr], y_sup[tr]
-    X_va, y_va = X_scaled[va], y_sup[va]
-    clf_cv = LogisticRegression(C=0.1, class_weight='balanced', max_iter=5000, solver='saga', n_jobs=-1)
-    clf_cv.fit(X_tr, y_tr)
-    preds = clf_cv.predict(X_va)
+    X_tr = torch.tensor(X_scaled[tr]); y_tr = torch.tensor(y_sup[tr], dtype=torch.long)
+    X_va = torch.tensor(X_scaled[va]); y_va = y_sup[va]
+
+    loader = DataLoader(TensorDataset(X_tr, y_tr), batch_size=128, shuffle=True)
+    mlp_cv = SeverityMLP(X_scaled.shape[1]).to(device)
+    opt_cv = torch.optim.AdamW(mlp_cv.parameters(), lr=3e-4, weight_decay=1e-4)
+    sched_cv = torch.optim.lr_scheduler.CosineAnnealingLR(opt_cv, T_max=80)
+    crit = nn.CrossEntropyLoss(weight=cw)
+
+    for ep in range(80):
+        mlp_cv.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt_cv.zero_grad()
+            crit(mlp_cv(xb), yb).backward()
+            opt_cv.step()
+        sched_cv.step()
+
+    mlp_cv.eval()
+    with torch.no_grad():
+        preds = mlp_cv(X_va.to(device)).argmax(1).cpu().numpy()
     s = f1_score(y_va, preds, average='macro', zero_division=0)
     logo_scores.append(s)
     print(f"  Site left out: {val_site:12s} | F1 = {s:.4f}")
-print(f"Mean LOGO F1 = {np.mean(logo_scores):.4f}")
+print(f"Mean LOGO F1 (MLP) = {np.mean(logo_scores):.4f}")
 
-# 4. Train final model on ALL supervised data
-print("\nTraining final model on all supervised data...")
-clf = LogisticRegression(C=0.1, class_weight='balanced', max_iter=5000, solver='saga', n_jobs=-1)
-clf.fit(X_scaled, y_sup)
+# 6. Train final MLP on ALL supervised data (more epochs, full data)
+print("\nTraining final MLP on all supervised data (150 epochs)...")
+X_all = torch.tensor(X_scaled); y_all = torch.tensor(y_sup, dtype=torch.long)
+loader_full = DataLoader(TensorDataset(X_all, y_all), batch_size=128, shuffle=True)
 
-train_f1 = f1_score(y_sup, clf.predict(X_scaled), average='macro', zero_division=0)
+mlp_final = SeverityMLP(X_scaled.shape[1]).to(device)
+opt_f  = torch.optim.AdamW(mlp_final.parameters(), lr=3e-4, weight_decay=1e-4)
+sched_f = torch.optim.lr_scheduler.CosineAnnealingLR(opt_f, T_max=150)
+crit = nn.CrossEntropyLoss(weight=cw)
+
+for ep in range(150):
+    mlp_final.train()
+    for xb, yb in loader_full:
+        xb, yb = xb.to(device), yb.to(device)
+        opt_f.zero_grad()
+        crit(mlp_final(xb), yb).backward()
+        opt_f.step()
+    sched_f.step()
+
+mlp_final.eval()
+with torch.no_grad():
+    train_preds = mlp_final(X_all.to(device)).argmax(1).cpu().numpy()
+train_f1 = f1_score(y_sup, train_preds, average='macro', zero_division=0)
 print(f"Train Macro F1 = {train_f1:.4f}")
 
-# 5. Save everything
+# 7. Save
 np.save(REPO_DIR / "valid_features.npy", valid_features_idx)
 np.save(REPO_DIR / "scaler_mean.npy", scaler_mean)
 np.save(REPO_DIR / "scaler_std.npy", scaler_std)
-np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
-np.save(REPO_DIR / "fusion_intercept.npy", clf.intercept_)
-print("Saved model parameters!")
+torch.save(mlp_final.state_dict(), REPO_DIR / "mlp_classifier.pth")
+print("Saved MLP model and scaler!")
 
 print("--- 4. Packaging Submission ---")
-for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy",
-              "fusion_coef.npy", "fusion_intercept.npy"]:
+for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy"]:
     shutil.copy2(REPO_DIR / fname, BASELINE_DIR / "weights" / fname)
+shutil.copy2(REPO_DIR / "mlp_classifier.pth", BASELINE_DIR / "weights" / "mlp_classifier.pth")
 
 momask_dest = BASELINE_DIR / "weights" / "momask"
 momask_dest.mkdir(parents=True, exist_ok=True)

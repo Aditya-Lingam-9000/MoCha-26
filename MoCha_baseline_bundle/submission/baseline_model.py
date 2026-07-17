@@ -26,9 +26,8 @@ def load_pretrained_weights(model, checkpoint):
     model_first_key = next(iter(model_dict))
     new_state_dict = collections.OrderedDict()
     for k, v in state_dict.items():
-        if 'module.' not in model_first_key:
-            if k.startswith('module.'):
-                k = k[7:]
+        if 'module.' not in model_first_key and k.startswith('module.'):
+            k = k[7:]
         if k in model_dict:
             new_state_dict[k] = v
     model_dict.update(new_state_dict)
@@ -37,13 +36,23 @@ def load_pretrained_weights(model, checkpoint):
 
 def extract_time_series_stats(tensor):
     mean = tensor.mean(dim=1).squeeze(0)
-    std = tensor.std(dim=1).squeeze(0)
-    max_v, _ = tensor.max(dim=1)
-    max_v = max_v.squeeze(0)
-    min_v, _ = tensor.min(dim=1)
-    min_v = min_v.squeeze(0)
-    std = torch.nan_to_num(std, 0.0)
+    std  = torch.nan_to_num(tensor.std(dim=1).squeeze(0), 0.0)
+    max_v = tensor.max(dim=1).values.squeeze(0)
+    min_v = tensor.min(dim=1).values.squeeze(0)
     return torch.cat([mean, std, max_v, min_v])
+
+
+# MLP architecture must match exactly what was trained in kaggle_notebook_cells.py
+class SeverityMLP(nn.Module):
+    def __init__(self, D: int, C: int = 4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(D, 1024), nn.LayerNorm(1024), nn.GELU(), nn.Dropout(0.45),
+            nn.Linear(1024, 256), nn.LayerNorm(256),  nn.GELU(), nn.Dropout(0.35),
+            nn.Linear(256,  64), nn.LayerNorm(64),   nn.GELU(), nn.Dropout(0.25),
+            nn.Linear(64, C),
+        )
+    def forward(self, x): return self.net(x)
 
 
 class Model:
@@ -58,31 +67,38 @@ class Model:
             apply_slope_correction=False,
         )
         self.baseline_wrapper = self._load_baseline()
-        self.momask_model = self._load_momask()
+        self.momask_model     = self._load_momask()
 
-        # Load classifier weights (saved from sklearn LR as numpy arrays)
+        # Preprocessing parameters
         self.valid_features = torch.from_numpy(
             np.load(ROOT / "weights" / "valid_features.npy")
         ).long().to(self.device)
+
         self.scaler_mean = torch.from_numpy(
             np.load(ROOT / "weights" / "scaler_mean.npy")
         ).float().to(self.device)
+
         self.scaler_std = torch.from_numpy(
             np.load(ROOT / "weights" / "scaler_std.npy")
         ).float().to(self.device)
-        self.coef = torch.from_numpy(
-            np.load(ROOT / "weights" / "fusion_coef.npy")
-        ).float().to(self.device)
-        self.intercept = torch.from_numpy(
-            np.load(ROOT / "weights" / "fusion_intercept.npy")
-        ).float().to(self.device)
 
+        # MLP classifier
+        n_feat = int(self.valid_features.shape[0])
+        self.mlp = SeverityMLP(n_feat).to(self.device)
+        state = torch.load(
+            ROOT / "weights" / "mlp_classifier.pth",
+            map_location=self.device,
+            weights_only=True,
+        )
+        self.mlp.load_state_dict(state)
+        self.mlp.eval()
+
+    # ------------------------------------------------------------------ #
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
         chk_path = ROOT / "weights" / "backbone" / "motion_encoder_finetuned.pth"
         opt = baseline_get_opt(opt_path, self.device)
         opt.checkpoints_dir = str(ROOT / "weights" / "backbone")
-
         wrapper = EvaluatorModelWrapper(opt)
         state = torch.load(chk_path, map_location=self.device, weights_only=True)
         wrapper.motion_encoder.load_state_dict(state)
@@ -93,7 +109,6 @@ class Model:
     def _load_momask(self):
         opt_path = str(ROOT / "weights" / "momask" / "opt.txt")
         chk_path = str(ROOT / "weights" / "momask" / "net_best_fid.tar")
-
         vq_opt = momask_get_opt.get_opt(opt_path, device=self.device)
         model = RVQVAE(
             args=vq_opt, input_width=263,
@@ -102,7 +117,7 @@ class Model:
             down_t=vq_opt.down_t, stride_t=vq_opt.stride_t,
             width=vq_opt.width, depth=vq_opt.depth,
             dilation_growth_rate=vq_opt.dilation_growth_rate,
-            activation=vq_opt.vq_act, norm=vq_opt.vq_norm
+            activation=vq_opt.vq_act, norm=vq_opt.vq_norm,
         )
         checkpoint = torch.load(chk_path, map_location=self.device)['net']
         load_pretrained_weights(model, checkpoint)
@@ -110,66 +125,61 @@ class Model:
         model.to(self.device)
         return model
 
+    # ------------------------------------------------------------------ #
     def _extract_features(self, motion_tensor: torch.Tensor, length: int) -> torch.Tensor:
         with torch.no_grad():
             raw_stats = extract_time_series_stats(motion_tensor)
-
-            length_tensor = torch.as_tensor([length], dtype=torch.long, device=self.device)
-            baseline_emb = self.baseline_wrapper.get_motion_embeddings_ordered(
-                motion_tensor, length_tensor
-            ).squeeze(0)
-
-            momask_out = self.momask_model(motion_tensor)
-            if isinstance(momask_out, tuple):
-                momask_out = momask_out[0]
-            if momask_out.shape[-1] == 512:
-                momask_stats = extract_time_series_stats(momask_out)
+            length_t  = torch.as_tensor([length], dtype=torch.long, device=self.device)
+            base_emb  = self.baseline_wrapper.get_motion_embeddings_ordered(
+                            motion_tensor, length_t).squeeze(0)
+            mo_out = self.momask_model(motion_tensor)
+            if isinstance(mo_out, tuple):
+                mo_out = mo_out[0]
+            if mo_out.shape[-1] == 512:
+                mo_stats = extract_time_series_stats(mo_out)
             else:
-                momask_stats = extract_time_series_stats(momask_out.permute(0, 2, 1))
-
-        return torch.cat([raw_stats, baseline_emb, momask_stats])
+                mo_stats = extract_time_series_stats(mo_out.permute(0, 2, 1))
+        return torch.cat([raw_stats, base_emb, mo_stats])
 
     def _classify(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (N, D) → predictions: (N,) int tensor."""
+        """features: (N, D_raw) → predictions: (N,) long tensor."""
         filtered = features[:, self.valid_features]
-        scaled = (filtered - self.scaler_mean) / self.scaler_std
-        logits = torch.matmul(scaled, self.coef.t()) + self.intercept
-        return torch.argmax(logits, dim=1)
+        scaled   = (filtered - self.scaler_mean) / self.scaler_std
+        with torch.no_grad():
+            logits = self.mlp(scaled)
+        return logits.argmax(dim=1)
 
-    def predict_dataset(self, dataset: Mapping[str, Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, int]]:
-        """Batch-extract all features then classify in one pass."""
+    # ------------------------------------------------------------------ #
+    def predict_dataset(
+        self,
+        dataset: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    ) -> dict[str, dict[str, int]]:
         predictions: dict[str, dict[str, int]] = {}
-        features_list = []
-        keys = []
+        features_list, keys = [], []
 
         print("Extracting features from test dataset...")
         for subject_id, walks in dataset.items():
             subject_key = str(subject_id)
             predictions[subject_key] = {}
             for walk_id, sample in walks.items():
-                walk_key = str(walk_id)
                 motion, length = self.preprocess(sample)
-                motion_tensor = torch.as_tensor(
-                    motion[None], dtype=torch.float32, device=self.device
-                )
+                motion_tensor  = torch.as_tensor(
+                    motion[None], dtype=torch.float32, device=self.device)
                 feat = self._extract_features(motion_tensor, length)
                 features_list.append(feat)
-                keys.append((subject_key, walk_key))
+                keys.append((subject_key, str(walk_id)))
 
         if features_list:
-            features = torch.stack(features_list)          # (N, D)
-            preds = self._classify(features).cpu().numpy()
-            for idx, (sub_key, walk_key) in enumerate(keys):
-                predictions[sub_key][walk_key] = int(preds[idx])
+            features = torch.stack(features_list)      # (N, D)
+            preds    = self._classify(features).cpu().numpy()
+            for idx, (sk, wk) in enumerate(keys):
+                predictions[sk][wk] = int(preds[idx])
 
         return predictions
 
     def predict(self, sample: Mapping[str, Any]) -> int:
-        """Single-sample fallback."""
         motion, length = self.preprocess(sample)
-        motion_tensor = torch.as_tensor(
-            motion[None], dtype=torch.float32, device=self.device
-        )
-        feat = self._extract_features(motion_tensor, length).unsqueeze(0)  # (1, D)
-        pred = self._classify(feat)
-        return int(pred.item())
+        motion_tensor  = torch.as_tensor(
+            motion[None], dtype=torch.float32, device=self.device)
+        feat = self._extract_features(motion_tensor, length).unsqueeze(0)
+        return int(self._classify(feat).item())
