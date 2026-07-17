@@ -256,7 +256,8 @@ print("--- 3. Domain Alignment, Quantile Scaling & Model Search ---")
 import joblib
 from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.linear_model import Ridge, LogisticRegression
-from sklearn.svm import SVC
+from sklearn.svm import SVC, SVR
+from sklearn.kernel_ridge import KernelRidge
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.ensemble import ExtraTreesClassifier
 import lightgbm as lgb
@@ -288,7 +289,7 @@ for s in np.unique(sites_sup):
     mask = sites_sup == s
     X_site_centered[mask] = X_site_centered[mask] - np.mean(X_site_centered[mask], axis=0)
 
-# Threshold optimization helper for Ordinal Ridge
+# Threshold optimization helper for Ordinal Regression
 def optimize_thresholds(y_true, y_pred_cont):
     def loss(thresholds):
         t0, t1, t2 = thresholds
@@ -311,7 +312,29 @@ def apply_thresholds(y_pred_cont, thresholds):
     preds[y_pred_cont >= t2] = 3
     return preds
 
-# Wrapper for Ordinal Ridge to fit scikit-learn interface
+# Wrapper for Ordinal SVR (RBF Kernel)
+class OrdinalSVRClassifier:
+    def __init__(self, C=1.0, gamma='scale', epsilon=0.1):
+        self.C = C
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.model = SVR(C=C, gamma=gamma, epsilon=epsilon, kernel='rbf')
+        self.thresholds = np.array([0.5, 1.5, 2.5])
+        
+    def fit(self, X, y):
+        class_counts = np.bincount(y, minlength=4)
+        cw = len(y) / (4.0 * np.where(class_counts == 0, 1, class_counts))
+        sw = cw[y]
+        self.model.fit(X, y, sample_weight=sw)
+        pred_cont = self.model.predict(X)
+        self.thresholds = optimize_thresholds(y, pred_cont)
+        return self
+
+    def predict(self, X):
+        pred_cont = self.model.predict(X)
+        return apply_thresholds(pred_cont, self.thresholds)
+
+# Wrapper for Ordinal Ridge
 class OrdinalRidgeClassifier:
     def __init__(self, alpha=10.0):
         self.alpha = alpha
@@ -337,15 +360,15 @@ unique_sites = np.unique(sites_sup)
 
 configs = [
     # (Name, Scaler_Type, Feature_Mode, K_features, Model_Class)
-    ("Quantile + Top 256 ANOVA + SVC (RBF C=1.0)", "quantile", "top_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Top 256 ANOVA + SVC (RBF C=2.0)", "quantile", "top_k", 256, SVC(C=2.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Top 256 ANOVA + SVC (RBF C=0.5)", "quantile", "top_k", 256, SVC(C=0.5, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Top 128 ANOVA + SVC (RBF C=1.0)", "quantile", "top_k", 128, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Clinical + Top 256 ANOVA + SVC (C=1.0)", "quantile", "clinical_plus_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
+    ("StandardScaler + Top 256 ANOVA + Ordinal SVR (C=1.0)", "standard", "top_k", 256, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
+    ("StandardScaler + Top 128 ANOVA + Ordinal SVR (C=1.0)", "standard", "top_k", 128, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
+    ("StandardScaler + Top 256 ANOVA + Ordinal SVR (C=2.0)", "standard", "top_k", 256, OrdinalSVRClassifier(C=2.0, epsilon=0.1)),
+    ("Quantile + Top 256 ANOVA + Ordinal SVR (C=1.0)", "quantile", "top_k", 256, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
     ("StandardScaler + Top 256 ANOVA + SVC (RBF C=1.0)", "standard", "top_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Top 256 ANOVA + Ordinal Ridge (a=10)", "quantile", "top_k", 256, OrdinalRidgeClassifier(alpha=10.0)),
+    ("StandardScaler + Top 128 ANOVA + SVC (RBF C=1.0)", "standard", "top_k", 128, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
+    ("Quantile + Top 256 ANOVA + SVC (RBF C=1.0)", "quantile", "top_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
     ("Quantile + Top 128 ANOVA + Ordinal Ridge (a=10)", "quantile", "top_k", 128, OrdinalRidgeClassifier(alpha=10.0)),
-    ("Quantile + Top 256 ANOVA + LightGBM (depth=3)", "quantile", "top_k", 256, lgb.LGBMClassifier(max_depth=3, n_estimators=100, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)),
+    ("StandardScaler + Top 128 ANOVA + Ordinal Ridge (a=10)", "standard", "top_k", 128, OrdinalRidgeClassifier(alpha=10.0)),
 ]
 
 best_score = -1.0
@@ -399,7 +422,7 @@ for name, stype, feat_mode, k_feat, model_template in configs:
         logo_scores.append(s)
         
     mean_s = np.mean(logo_scores)
-    print(f"Config: {name:50s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
+    print(f"Config: {name:52s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
     if mean_s > best_score:
         best_score = mean_s
         best_config = (name, stype, feat_mode, k_feat, model_template)
@@ -472,28 +495,5 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
 
 print(f"Kaggle Pipeline Complete! Download {zip_path} from the Kaggle Output section and submit to CodaBench!")
 
-print("--- 4. Packaging Submission ---")
-for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy",
-              "fusion_coef.npy", "fusion_intercept.npy", "model_type.npy", "thresholds.npy"]:
-    shutil.copy2(REPO_DIR / fname, BASELINE_DIR / "weights" / fname)
 
-momask_dest = BASELINE_DIR / "weights" / "momask"
-momask_dest.mkdir(parents=True, exist_ok=True)
-momask_src = CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask"
-shutil.copy2(momask_src / "opt.txt", momask_dest / "opt.txt")
-shutil.copy2(momask_src / "net_best_fid.tar", momask_dest / "net_best_fid.tar")
-
-zip_path = KAGGLE_WORKING / "submission.zip"
-exclude_dirs = [".git", "classifier"]
-
-with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-    for root, dirs, files in os.walk(BASELINE_DIR):
-        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.')]
-        for file in files:
-            if file.endswith('.pyc'): continue
-            file_path = Path(root) / file
-            arcname = file_path.relative_to(BASELINE_DIR)
-            zipf.write(file_path, arcname)
-
-print(f"Kaggle Pipeline Complete! Download {zip_path} from the Kaggle Output section and submit to CodaBench!")
 
