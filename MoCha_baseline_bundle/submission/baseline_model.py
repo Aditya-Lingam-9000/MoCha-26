@@ -5,6 +5,7 @@ import collections
 
 import numpy as np
 import torch
+import joblib
 
 from model.momask.model import RVQVAE
 import model.momask.get_opt as momask_get_opt
@@ -56,30 +57,27 @@ class Model:
         self.baseline_wrapper = self._load_baseline()
         self.momask_model = self._load_momask()
 
-        # Feature selection & global scaler
-        self.valid_features = torch.from_numpy(
-            np.load(ROOT / "weights" / "valid_features.npy")
-        ).long().to(self.device)
+        # Feature selection & scaler
+        self.valid_features = np.load(ROOT / "weights" / "valid_features.npy")
+        
+        # Load fitted scaler, sub_idx, and classifier
+        scaler_path = ROOT / "weights" / "scaler.joblib"
+        sub_idx_path = ROOT / "weights" / "sub_idx.joblib"
+        clf_path = ROOT / "weights" / "classifier.joblib"
 
-        self.scaler_mean = torch.from_numpy(
-            np.load(ROOT / "weights" / "scaler_mean.npy")
-        ).float().to(self.device)
-
-        self.scaler_std = torch.from_numpy(
-            np.load(ROOT / "weights" / "scaler_std.npy")
-        ).float().to(self.device)
-
-        # Model weights
-        self.coef = torch.from_numpy(
-            np.load(ROOT / "weights" / "fusion_coef.npy")
-        ).float().to(self.device)
-
-        self.intercept = torch.from_numpy(
-            np.load(ROOT / "weights" / "fusion_intercept.npy")
-        ).float().to(self.device)
-
-        self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
-        self.thresholds = np.load(ROOT / "weights" / "thresholds.npy")
+        if scaler_path.exists() and clf_path.exists():
+            self.scaler = joblib.load(scaler_path)
+            self.sub_idx = joblib.load(sub_idx_path) if sub_idx_path.exists() else None
+            self.clf = joblib.load(clf_path)
+            self.use_joblib = True
+        else:
+            self.use_joblib = False
+            self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "scaler_mean.npy")).float().to(self.device)
+            self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "scaler_std.npy")).float().to(self.device)
+            self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
+            self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
+            self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
+            self.thresholds = np.load(ROOT / "weights" / "thresholds.npy")
 
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
@@ -135,14 +133,21 @@ class Model:
 
     def _classify(self, features: torch.Tensor) -> torch.Tensor:
         """features: (N, D_raw) -> predictions: (N,) int tensor."""
-        filtered = features[:, self.valid_features]
+        feat_np = features.cpu().numpy()
+        
+        if getattr(self, 'use_joblib', False):
+            filtered = feat_np[:, self.valid_features]
+            scaled = self.scaler.transform(filtered)
+            preds = self.clf.predict(scaled)
+            return torch.from_numpy(preds).to(self.device)
+
+        valid_torch = torch.from_numpy(self.valid_features).long().to(self.device)
+        filtered = features[:, valid_torch]
         scaled = (filtered - self.scaler_mean) / self.scaler_std
 
         if self.model_type == 1:
-            # Ordinal Ridge Regression
             pred_cont = torch.matmul(scaled, self.coef.t()) + self.intercept
             pred_cont_np = pred_cont.squeeze(-1).cpu().numpy()
-            
             t0, t1, t2 = self.thresholds
             preds = np.zeros_like(pred_cont_np, dtype=int)
             preds[pred_cont_np >= t0] = 1
@@ -150,7 +155,6 @@ class Model:
             preds[pred_cont_np >= t2] = 3
             return torch.from_numpy(preds).to(self.device)
         else:
-            # Multi-class Logistic Regression
             logits = torch.matmul(scaled, self.coef.t()) + self.intercept
             return torch.argmax(logits, dim=1)
 
