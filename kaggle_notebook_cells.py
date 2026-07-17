@@ -252,14 +252,14 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Domain Alignment, Quantile Scaling & Model Search ---")
+print("--- 3. Ensemble Modeling, GroupKFold & LOGO-CV Evaluation ---")
 import joblib
 from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.svm import SVC, SVR
-from sklearn.kernel_ridge import KernelRidge
+from sklearn.ensemble import VotingClassifier, ExtraTreesClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.model_selection import GroupKFold
 import lightgbm as lgb
 from scipy.optimize import minimize
 from sklearn.metrics import f1_score
@@ -269,6 +269,7 @@ df_sup = df[df['label'] != -1].copy()
 X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label', 'site']).values
 y_sup = df_sup['label'].values.astype(int)
 sites_sup = df_sup['site'].values
+subjects_sup = df_sup['subject_id'].values
 
 num_total_features = X_sup.shape[1]
 num_clinical = 36
@@ -334,41 +335,24 @@ class OrdinalSVRClassifier:
         pred_cont = self.model.predict(X)
         return apply_thresholds(pred_cont, self.thresholds)
 
-# Wrapper for Ordinal Ridge
-class OrdinalRidgeClassifier:
-    def __init__(self, alpha=10.0):
-        self.alpha = alpha
-        self.model = Ridge(alpha=alpha)
-        self.thresholds = np.array([0.5, 1.5, 2.5])
-        
-    def fit(self, X, y):
-        class_counts = np.bincount(y, minlength=4)
-        cw = len(y) / (4.0 * np.where(class_counts == 0, 1, class_counts))
-        sw = cw[y]
-        self.model.fit(X, y, sample_weight=sw)
-        pred_cont = self.model.predict(X)
-        self.thresholds = optimize_thresholds(y, pred_cont)
-        return self
+# Ensemble Soft-Voting Classifier
+def build_ensemble():
+    m1 = SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
+    m2 = LogisticRegression(C=0.1, class_weight='balanced', max_iter=2000, solver='lbfgs')
+    m3 = lgb.LGBMClassifier(max_depth=3, n_estimators=100, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
+    return VotingClassifier(estimators=[('svc', m1), ('lr', m2), ('lgb', m3)], voting='soft')
 
-    def predict(self, X):
-        pred_cont = self.model.predict(X)
-        return apply_thresholds(pred_cont, self.thresholds)
-
-# 3. LOGO-CV Search across feature selection, scaling & models
-print("\nRunning Leave-One-Site-Out (LOGO) Cross-Validation Search...")
+# 3. Model Search under LOGO-CV and GroupKFold
+print("\n--- Running Cross-Validation Search ---")
 unique_sites = np.unique(sites_sup)
+gkf = GroupKFold(n_splits=5)
 
 configs = [
-    # (Name, Scaler_Type, Feature_Mode, K_features, Model_Class)
-    ("StandardScaler + Top 256 ANOVA + Ordinal SVR (C=1.0)", "standard", "top_k", 256, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
-    ("StandardScaler + Top 128 ANOVA + Ordinal SVR (C=1.0)", "standard", "top_k", 128, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
-    ("StandardScaler + Top 256 ANOVA + Ordinal SVR (C=2.0)", "standard", "top_k", 256, OrdinalSVRClassifier(C=2.0, epsilon=0.1)),
-    ("Quantile + Top 256 ANOVA + Ordinal SVR (C=1.0)", "quantile", "top_k", 256, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
+    ("StandardScaler + Top 256 ANOVA + Soft Ensemble (SVC+LR+LGB)", "standard", "top_k", 256, build_ensemble()),
+    ("StandardScaler + Top 128 ANOVA + Soft Ensemble (SVC+LR+LGB)", "standard", "top_k", 128, build_ensemble()),
     ("StandardScaler + Top 256 ANOVA + SVC (RBF C=1.0)", "standard", "top_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("StandardScaler + Top 128 ANOVA + SVC (RBF C=1.0)", "standard", "top_k", 128, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Top 256 ANOVA + SVC (RBF C=1.0)", "quantile", "top_k", 256, SVC(C=1.0, kernel='rbf', class_weight='balanced', random_state=42)),
-    ("Quantile + Top 128 ANOVA + Ordinal Ridge (a=10)", "quantile", "top_k", 128, OrdinalRidgeClassifier(alpha=10.0)),
-    ("StandardScaler + Top 128 ANOVA + Ordinal Ridge (a=10)", "standard", "top_k", 128, OrdinalRidgeClassifier(alpha=10.0)),
+    ("StandardScaler + Top 256 ANOVA + Ordinal SVR (C=1.0)", "standard", "top_k", 256, OrdinalSVRClassifier(C=1.0, epsilon=0.1)),
+    ("Quantile + Top 256 ANOVA + Soft Ensemble (SVC+LR+LGB)", "quantile", "top_k", 256, build_ensemble()),
 ]
 
 best_score = -1.0
@@ -376,7 +360,9 @@ best_config = None
 
 for name, stype, feat_mode, k_feat, model_template in configs:
     logo_scores = []
+    gkf_scores = []
     
+    # 1. LOGO-CV Evaluation
     for val_site in unique_sites:
         tr = sites_sup != val_site
         va = sites_sup == val_site
@@ -385,7 +371,6 @@ for name, stype, feat_mode, k_feat, model_template in configs:
         X_va_raw = X_site_centered[va]
         y_tr, y_va = y_sup[tr], y_sup[va]
         
-        # Fit scaler on train fold
         if stype == "quantile":
             scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(y_tr), 1000))
         else:
@@ -394,21 +379,9 @@ for name, stype, feat_mode, k_feat, model_template in configs:
         X_tr_scaled = scaler.fit_transform(X_tr_raw)
         X_va_scaled = scaler.transform(X_va_raw)
         
-        # Select features inside fold
-        if feat_mode == "clinical_only":
-            sub_idx = clinical_indices_filtered
-        elif feat_mode == "top_k":
-            selector = SelectKBest(f_classif, k=k_feat)
-            selector.fit(X_tr_scaled, y_tr)
-            sub_idx = selector.get_support(indices=True)
-        elif feat_mode == "clinical_plus_k":
-            non_clinical = [i for i in range(X_tr_scaled.shape[1]) if i not in clinical_indices_filtered]
-            selector = SelectKBest(f_classif, k=k_feat)
-            selector.fit(X_tr_scaled[:, non_clinical], y_tr)
-            selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
-            sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
-        else:
-            sub_idx = list(range(X_tr_scaled.shape[1]))
+        selector = SelectKBest(f_classif, k=k_feat)
+        selector.fit(X_tr_scaled, y_tr)
+        sub_idx = selector.get_support(indices=True)
             
         X_tr = X_tr_scaled[:, sub_idx]
         X_va = X_va_scaled[:, sub_idx]
@@ -417,14 +390,40 @@ for name, stype, feat_mode, k_feat, model_template in configs:
         clf = copy.deepcopy(model_template)
         clf.fit(X_tr, y_tr)
         preds = clf.predict(X_va)
-            
         s = f1_score(y_va, preds, average='macro', zero_division=0)
         logo_scores.append(s)
         
-    mean_s = np.mean(logo_scores)
-    print(f"Config: {name:52s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
-    if mean_s > best_score:
-        best_score = mean_s
+    # 2. GroupKFold (by Subject) Evaluation
+    for tr, va in gkf.split(X_site_centered, y_sup, groups=subjects_sup):
+        X_tr_raw, X_va_raw = X_site_centered[tr], X_site_centered[va]
+        y_tr, y_va = y_sup[tr], y_sup[va]
+        
+        if stype == "quantile":
+            scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(y_tr), 1000))
+        else:
+            scaler = StandardScaler()
+            
+        X_tr_scaled = scaler.fit_transform(X_tr_raw)
+        X_va_scaled = scaler.transform(X_va_raw)
+        
+        selector = SelectKBest(f_classif, k=k_feat)
+        selector.fit(X_tr_scaled, y_tr)
+        sub_idx = selector.get_support(indices=True)
+            
+        X_tr = X_tr_scaled[:, sub_idx]
+        X_va = X_va_scaled[:, sub_idx]
+        
+        clf = copy.deepcopy(model_template)
+        clf.fit(X_tr, y_tr)
+        preds = clf.predict(X_va)
+        s = f1_score(y_va, preds, average='macro', zero_division=0)
+        gkf_scores.append(s)
+        
+    mean_logo = np.mean(logo_scores)
+    mean_gkf = np.mean(gkf_scores)
+    print(f"Config: {name:58s} | LOGO F1 = {mean_logo:.4f} | Subject GroupKFold F1 = {mean_gkf:.4f}")
+    if mean_logo > best_score:
+        best_score = mean_logo
         best_config = (name, stype, feat_mode, k_feat, model_template)
 
 print(f"\nWinning Config: {best_config[0]} with Mean LOGO F1 = {best_score:.4f}")
@@ -439,20 +438,9 @@ else:
 
 X_scaled_final = final_scaler.fit_transform(X_site_centered)
 
-if feat_mode == "clinical_only":
-    final_sub_idx = clinical_indices_filtered
-elif feat_mode == "top_k":
-    selector = SelectKBest(f_classif, k=k_feat)
-    selector.fit(X_scaled_final, y_sup)
-    final_sub_idx = selector.get_support(indices=True)
-elif feat_mode == "clinical_plus_k":
-    non_clinical = [i for i in range(X_scaled_final.shape[1]) if i not in clinical_indices_filtered]
-    selector = SelectKBest(f_classif, k=k_feat)
-    selector.fit(X_scaled_final[:, non_clinical], y_sup)
-    selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
-    final_sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
-else:
-    final_sub_idx = list(range(X_scaled_final.shape[1]))
+selector = SelectKBest(f_classif, k=k_feat)
+selector.fit(X_scaled_final, y_sup)
+final_sub_idx = selector.get_support(indices=True)
 
 final_valid_features_idx = valid_features_idx[final_sub_idx]
 X_final_input = X_scaled_final[:, final_sub_idx]
