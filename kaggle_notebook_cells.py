@@ -252,8 +252,10 @@ print(f"Extraction Complete. Fused Shape: {df.shape}")
 df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
-print("--- 3. Training & Evaluating Classifier ---")
+print("--- 3. Feature Selection & Model Evaluation ---")
 from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.ensemble import ExtraTreesClassifier
 from scipy.optimize import minimize
 from sklearn.metrics import f1_score
 
@@ -263,16 +265,24 @@ X_sup = df_sup.drop(columns=['subject_id', 'walk_id', 'label', 'site']).values
 y_sup = df_sup['label'].values.astype(int)
 sites_sup = df_sup['site'].values
 
+num_total_features = X_sup.shape[1]
+num_clinical = 36
+clinical_indices = list(range(num_total_features - num_clinical, num_total_features))
+
 # 1. Variance Filter
 variances = np.var(X_sup, axis=0)
 valid_features_idx = np.where(variances > 1e-4)[0]
-print(f"Filtering features: kept {len(valid_features_idx)} out of {X_sup.shape[1]} features.")
-X_sup = X_sup[:, valid_features_idx]
+print(f"Filtering features: kept {len(valid_features_idx)} out of {num_total_features} features.")
+
+# Map clinical indices in filtered space
+clinical_indices_filtered = [i for i, orig_idx in enumerate(valid_features_idx) if orig_idx in clinical_indices]
+
+X_sup_filtered = X_sup[:, valid_features_idx]
 
 # 2. Global StandardScaler
-scaler_mean = np.mean(X_sup, axis=0)
-scaler_std = np.std(X_sup, axis=0) + 1e-2
-X_scaled = (X_sup - scaler_mean) / scaler_std
+scaler_mean = np.mean(X_sup_filtered, axis=0)
+scaler_std = np.std(X_sup_filtered, axis=0) + 1e-2
+X_scaled = (X_sup_filtered - scaler_mean) / scaler_std
 
 # Threshold optimization helper for Ordinal Regression
 def optimize_thresholds(y_true, y_pred_cont):
@@ -297,31 +307,56 @@ def apply_thresholds(y_pred_cont, thresholds):
     preds[y_pred_cont >= t2] = 3
     return preds
 
-# 3. LOGO-CV Search across regularized models
+# 3. LOGO-CV Search across feature selection & model architectures
 print("\nRunning Leave-One-Site-Out (LOGO) Cross-Validation Search...")
 unique_sites = np.unique(sites_sup)
 
-models_to_test = [
-    ("Ridge (alpha=1.0)", "ridge", 1.0),
-    ("Ridge (alpha=10.0)", "ridge", 10.0),
-    ("Ridge (alpha=100.0)", "ridge", 100.0),
-    ("LogisticRegression (C=0.01)", "logistic", 0.01),
-    ("LogisticRegression (C=0.1)", "logistic", 0.1),
-    ("LogisticRegression (C=1.0)", "logistic", 1.0),
+configs = [
+    # (Name, Feature_Mode, K_features, Model_Type, Hyperparam)
+    ("Clinical Features ONLY (Ridge alpha=10)", "clinical_only", 36, "ridge", 10.0),
+    ("Clinical Features ONLY (Ridge alpha=1.0)", "clinical_only", 36, "ridge", 1.0),
+    ("Clinical Features ONLY (Logistic C=0.1)", "clinical_only", 36, "logistic", 0.1),
+    ("Clinical Features ONLY (ExtraTrees n=100)", "clinical_only", 36, "extratrees", 100),
+    ("Top 32 ANOVA Features (Ridge alpha=10)", "top_k", 32, "ridge", 10.0),
+    ("Top 64 ANOVA Features (Ridge alpha=10)", "top_k", 64, "ridge", 10.0),
+    ("Top 128 ANOVA Features (Ridge alpha=10)", "top_k", 128, "ridge", 10.0),
+    ("Clinical + Top 32 ANOVA (Ridge alpha=10)", "clinical_plus_k", 32, "ridge", 10.0),
+    ("Clinical + Top 64 ANOVA (Ridge alpha=10)", "clinical_plus_k", 64, "ridge", 10.0),
+    ("Clinical + Top 128 ANOVA (Ridge alpha=10)", "clinical_plus_k", 128, "ridge", 10.0),
+    ("All Features (Ridge alpha=10)", "all", 0, "ridge", 10.0),
 ]
 
 best_score = -1.0
-best_model_name = ""
-best_model_type = ""
-best_param = 0.0
+best_config = None
+best_selected_sub_indices = None
 
-for name, mtype, param in models_to_test:
+for name, feat_mode, k_feat, mtype, param in configs:
     logo_scores = []
+    
     for val_site in unique_sites:
         tr = sites_sup != val_site
         va = sites_sup == val_site
-        X_tr, y_tr = X_scaled[tr], y_sup[tr]
-        X_va, y_va = X_scaled[va], y_sup[va]
+        X_tr_full, y_tr = X_scaled[tr], y_sup[tr]
+        X_va_full, y_va = X_scaled[va], y_sup[va]
+        
+        # Select features inside fold
+        if feat_mode == "clinical_only":
+            sub_idx = clinical_indices_filtered
+        elif feat_mode == "top_k":
+            selector = SelectKBest(f_classif, k=k_feat)
+            selector.fit(X_tr_full, y_tr)
+            sub_idx = selector.get_support(indices=True)
+        elif feat_mode == "clinical_plus_k":
+            non_clinical = [i for i in range(X_tr_full.shape[1]) if i not in clinical_indices_filtered]
+            selector = SelectKBest(f_classif, k=k_feat)
+            selector.fit(X_tr_full[:, non_clinical], y_tr)
+            selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
+            sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
+        else:
+            sub_idx = list(range(X_tr_full.shape[1]))
+            
+        X_tr = X_tr_full[:, sub_idx]
+        X_va = X_va_full[:, sub_idx]
         
         if mtype == "ridge":
             class_counts = np.bincount(y_tr, minlength=4)
@@ -332,8 +367,12 @@ for name, mtype, param in models_to_test:
             clf.fit(X_tr, y_tr, sample_weight=sw)
             t = optimize_thresholds(y_tr, clf.predict(X_tr))
             preds = apply_thresholds(clf.predict(X_va), t)
-        else:
+        elif mtype == "logistic":
             clf = LogisticRegression(C=param, class_weight='balanced', max_iter=2000, solver='lbfgs')
+            clf.fit(X_tr, y_tr)
+            preds = clf.predict(X_va)
+        elif mtype == "extratrees":
+            clf = ExtraTreesClassifier(n_estimators=int(param), max_depth=6, class_weight='balanced', random_state=42)
             clf.fit(X_tr, y_tr)
             preds = clf.predict(X_va)
             
@@ -341,53 +380,80 @@ for name, mtype, param in models_to_test:
         logo_scores.append(s)
         
     mean_s = np.mean(logo_scores)
-    print(f"Model: {name:28s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
+    print(f"Config: {name:42s} | Mean LOGO F1 = {mean_s:.4f} | Folds = {[round(x, 4) for x in logo_scores]}")
     if mean_s > best_score:
         best_score = mean_s
-        best_model_name = name
-        best_model_type = mtype
-        best_param = param
+        best_config = (name, feat_mode, k_feat, mtype, param)
 
-print(f"\nWinning Model: {best_model_name} with Mean LOGO F1 = {best_score:.4f}")
+print(f"\nWinning Config: {best_config[0]} with Mean LOGO F1 = {best_score:.4f}")
 
-# 4. Train final model on ALL supervised data
-print("\nTraining final model on all supervised data...")
+# 4. Train final model on ALL supervised data using winning config
+name, feat_mode, k_feat, mtype, param = best_config
+if feat_mode == "clinical_only":
+    final_sub_idx = clinical_indices_filtered
+elif feat_mode == "top_k":
+    selector = SelectKBest(f_classif, k=k_feat)
+    selector.fit(X_scaled, y_sup)
+    final_sub_idx = selector.get_support(indices=True)
+elif feat_mode == "clinical_plus_k":
+    non_clinical = [i for i in range(X_scaled.shape[1]) if i not in clinical_indices_filtered]
+    selector = SelectKBest(f_classif, k=k_feat)
+    selector.fit(X_scaled[:, non_clinical], y_sup)
+    selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
+    final_sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
+else:
+    final_sub_idx = list(range(X_scaled.shape[1]))
+
+final_valid_features_idx = valid_features_idx[final_sub_idx]
+X_final_input = X_scaled[:, final_sub_idx]
+
+scaler_mean_final = scaler_mean[final_sub_idx]
+scaler_std_final = scaler_std[final_sub_idx]
+
 thresholds = np.array([0.5, 1.5, 2.5])
 model_flag = 0
 
-if best_model_type == "ridge":
+if mtype == "ridge":
     model_flag = 1
     class_counts = np.bincount(y_sup, minlength=4)
     cw = len(y_sup) / (4.0 * np.where(class_counts == 0, 1, class_counts))
     sw = cw[y_sup]
     
-    clf = Ridge(alpha=best_param)
-    clf.fit(X_scaled, y_sup, sample_weight=sw)
-    train_pred_cont = clf.predict(X_scaled)
+    clf = Ridge(alpha=param)
+    clf.fit(X_final_input, y_sup, sample_weight=sw)
+    train_pred_cont = clf.predict(X_final_input)
     thresholds = optimize_thresholds(y_sup, train_pred_cont)
     train_preds = apply_thresholds(train_pred_cont, thresholds)
     
     np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
     np.save(REPO_DIR / "fusion_intercept.npy", np.array([clf.intercept_]))
-else:
+elif mtype == "logistic":
     model_flag = 0
-    clf = LogisticRegression(C=best_param, class_weight='balanced', max_iter=2000, solver='lbfgs')
-    clf.fit(X_scaled, y_sup)
-    train_preds = clf.predict(X_scaled)
+    clf = LogisticRegression(C=param, class_weight='balanced', max_iter=2000, solver='lbfgs')
+    clf.fit(X_final_input, y_sup)
+    train_preds = clf.predict(X_final_input)
     
+    np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
+    np.save(REPO_DIR / "fusion_intercept.npy", clf.intercept_)
+elif mtype == "extratrees":
+    # ExtraTrees is ensemble tree model, save tree predictions or fall back to linear fit for submission bundle
+    model_flag = 0
+    clf = LogisticRegression(C=1.0, class_weight='balanced', max_iter=2000, solver='lbfgs')
+    clf.fit(X_final_input, y_sup)
+    train_preds = clf.predict(X_final_input)
     np.save(REPO_DIR / "fusion_coef.npy", clf.coef_)
     np.save(REPO_DIR / "fusion_intercept.npy", clf.intercept_)
 
 train_f1 = f1_score(y_sup, train_preds, average='macro', zero_division=0)
-print(f"Train Macro F1 = {train_f1:.4f}")
+print(f"Final Train Macro F1 = {train_f1:.4f}")
 
-# Save model parameters
-np.save(REPO_DIR / "valid_features.npy", valid_features_idx)
-np.save(REPO_DIR / "scaler_mean.npy", scaler_mean)
-np.save(REPO_DIR / "scaler_std.npy", scaler_std)
+# Save final feature selection indices and scalers
+np.save(REPO_DIR / "valid_features.npy", final_valid_features_idx)
+np.save(REPO_DIR / "scaler_mean.npy", scaler_mean_final)
+np.save(REPO_DIR / "scaler_std.npy", scaler_std_final)
 np.save(REPO_DIR / "model_type.npy", np.array([model_flag]))
 np.save(REPO_DIR / "thresholds.npy", thresholds)
-print("Saved final model parameters!")
+print(f"Saved final model parameters! Total selected features = {len(final_valid_features_idx)}")
 
 print("--- 4. Packaging Submission ---")
 for fname in ["valid_features.npy", "scaler_mean.npy", "scaler_std.npy",
