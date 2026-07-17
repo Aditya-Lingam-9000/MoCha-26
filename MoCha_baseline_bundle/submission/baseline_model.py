@@ -138,10 +138,8 @@ class Model:
                 # 1. Filter features
                 features_filtered = features[:, self.valid_features]
                 
-                # 2. Site Normalization (Compute mean/std of this test dataset)
-                mean = features_filtered.mean(dim=0, keepdim=True)
-                std = features_filtered.std(dim=0, keepdim=True) + 1e-2
-                features_scaled = (features_filtered - mean) / std
+                # 2. Scale using TRAINING statistics (must match what PCA was fitted on)
+                features_scaled = (features_filtered - self.global_scaler_mean) / self.global_scaler_std
                 
                 # 3. PCA Projection
                 features_pca = torch.matmul(features_scaled - self.pca_mean, self.pca_components.t())
