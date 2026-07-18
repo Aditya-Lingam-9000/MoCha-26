@@ -1,0 +1,1 @@
+command: python3 -c "print('Participant package ready; organizer ingestion imports run.py')"

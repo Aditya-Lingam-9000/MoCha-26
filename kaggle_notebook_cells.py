@@ -153,13 +153,16 @@ def load_pretrained_weights(model, checkpoint):
     model.load_state_dict(model_dict, strict=True)
 
 def extract_time_series_stats(tensor):
-    mean = tensor.mean(dim=1).squeeze(0)
-    std = tensor.std(dim=1).squeeze(0)
-    max_v, _ = tensor.max(dim=1)
-    max_v = max_v.squeeze(0)
-    min_v, _ = tensor.min(dim=1)
-    min_v = min_v.squeeze(0)
-    std = torch.nan_to_num(std, 0.0)
+    mean = torch.nan_to_num(tensor.mean(dim=1).squeeze(0), 0.0)
+    std = torch.nan_to_num(tensor.std(dim=1).squeeze(0), 0.0)
+    
+    if tensor.shape[1] == 0:
+        max_v = torch.zeros_like(mean)
+        min_v = torch.zeros_like(mean)
+    else:
+        max_v = torch.nan_to_num(tensor.max(dim=1).values.squeeze(0), 0.0, posinf=0.0, neginf=0.0)
+        min_v = torch.nan_to_num(tensor.min(dim=1).values.squeeze(0), 0.0, posinf=0.0, neginf=0.0)
+        
     return torch.cat([mean, std, max_v, min_v])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -232,6 +235,7 @@ for pkl_file in pkl_files:
                 momask_stats = extract_time_series_stats(momask_out) if momask_out.shape[-1] == 512 else extract_time_series_stats(momask_out.permute(0, 2, 1))
                 
             clinical_feat = extract_clinical_gait_features(joints, fps=25.0)
+            clinical_feat = np.nan_to_num(clinical_feat, nan=0.0, posinf=0.0, neginf=0.0)
             combined = np.concatenate([
                 raw_stats.cpu().numpy(),
                 baseline_emb.cpu().numpy(),

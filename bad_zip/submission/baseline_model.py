@@ -136,7 +136,6 @@ class Model:
             clinical_feat = extract_clinical_gait_features(joints, fps=25.0)
             clinical_feat = np.nan_to_num(clinical_feat, nan=0.0, posinf=0.0, neginf=0.0)
             clinical_tensor = torch.from_numpy(clinical_feat).float().to(self.device)
-            clinical_tensor = torch.nan_to_num(clinical_tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
         return torch.cat([raw_stats, base_emb, mo_stats, clinical_tensor])
 
