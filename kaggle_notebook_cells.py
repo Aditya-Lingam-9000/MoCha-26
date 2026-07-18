@@ -253,9 +253,52 @@ df.to_csv(REPO_DIR / "features_fused.csv", index=False)
 print("Saved features to features_fused.csv so you never have to extract again!")
 
 print("--- 3. Advanced Feature Selection & Ensemble Search ---")
+
+# ── PATH SAFETY: Ensure all directories are writable ────────────────────────
+# This block runs whether Section 1 was executed or not in this session.
+import subprocess
+from pathlib import Path
+KAGGLE_WORKING = Path("/kaggle/working")
+REPO_DIR       = KAGGLE_WORKING / "MoCha-26"
+BASELINE_DIR   = REPO_DIR / "MoCha_baseline_bundle"
+CAREPD_DIR     = REPO_DIR / "CARE-PD_github"
+
+# Clone repo if not already present at writable path
+if not REPO_DIR.exists():
+    print("Cloning repo to writable path...")
+    subprocess.run(f"git clone https://github.com/Aditya-Lingam-9000/MoCha-26.git {REPO_DIR}", shell=True, check=True)
+    # Restore baseline weights from the read-only input dataset if available
+    import glob, shutil
+    for src in glob.glob("/kaggle/input/**/weights/**/*", recursive=True):
+        src_p = Path(src)
+        if src_p.is_file() and "MoCha_baseline_bundle" in str(src_p):
+            rel = src_p.relative_to(Path(src_p.parts[0]) / src_p.parts[1] / src_p.parts[2] / "MoCha-26")
+            dst = REPO_DIR / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                shutil.copy2(src_p, dst)
+
+# Load features_fused.csv — try writable dir first, then read-only input
+import os
+csv_candidates = [
+    REPO_DIR / "features_fused.csv",
+    *list(Path("/kaggle/input").glob("**/features_fused.csv")),
+]
+csv_path = next((p for p in csv_candidates if p.exists()), None)
+if csv_path is None:
+    raise FileNotFoundError(
+        "features_fused.csv not found! Please run Section 2 first to extract features."
+    )
+print(f"Loading features from: {csv_path}")
+df = pd.read_csv(csv_path, low_memory=False)
+print(f"Loaded features: {df.shape}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 import joblib
 from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.linear_model import Ridge, LogisticRegression
+
 from sklearn.svm import SVC, SVR
 from sklearn.ensemble import VotingClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif, SelectFromModel
