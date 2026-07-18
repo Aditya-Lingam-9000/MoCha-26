@@ -284,11 +284,11 @@ print(f"Filtering features: kept {len(valid_features_idx)} out of {num_total_fea
 clinical_indices_filtered = [i for i, orig_idx in enumerate(valid_features_idx) if orig_idx in clinical_indices]
 X_sup_filtered = X_sup[:, valid_features_idx]
 
-# 2. Site-Wise Mean Centering (to align site domains)
-X_site_centered = X_sup_filtered.copy()
-for s in np.unique(sites_sup):
-    mask = sites_sup == s
-    X_site_centered[mask] = X_site_centered[mask] - np.mean(X_site_centered[mask], axis=0)
+# NOTE: Site-wise mean centering is intentionally REMOVED.
+# It cannot be replicated at CodaBench inference time (test site labels are unknown).
+# Fitting the scaler on site-centered data caused 0.00 CodaBench scores.
+# We use X_sup_filtered directly for a consistent train/inference pipeline.
+X_site_centered = X_sup_filtered  # alias kept so rest of code is unchanged
 
 # Ensemble Soft-Voting Classifier Helper (4 Diverse Classifiers)
 def build_ensemble(weights=[2.0, 1.0, 1.0, 1.0]):

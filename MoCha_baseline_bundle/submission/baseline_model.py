@@ -136,10 +136,18 @@ class Model:
         feat_np = features.cpu().numpy()
         
         if getattr(self, 'use_joblib', False):
+            expected_raw = int(np.max(self.valid_features)) + 1
+            actual_raw = feat_np.shape[1]
+            if actual_raw < expected_raw:
+                raise ValueError(
+                    f"Feature dimension mismatch: inference has {actual_raw} features "
+                    f"but valid_features expects at least {expected_raw}. "
+                    f"Check that _extract_features() matches training pipeline."
+                )
             filtered = feat_np[:, self.valid_features]
             scaled = self.scaler.transform(filtered)
             preds = self.clf.predict(scaled)
-            return torch.from_numpy(preds).to(self.device)
+            return torch.from_numpy(np.array(preds, dtype=np.int64)).to(self.device)
 
         valid_torch = torch.from_numpy(self.valid_features).long().to(self.device)
         filtered = features[:, valid_torch]
