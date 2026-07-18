@@ -509,32 +509,61 @@ train_f1 = f1_score(y_sup, train_preds, average='macro', zero_division=0)
 print(f"Final Train Macro F1 = {train_f1:.4f}")
 
 # Save exact winning model, scaler, and selected indices using joblib
-np.save(REPO_DIR / "valid_features.npy", final_valid_features_idx)
-joblib.dump(final_scaler, REPO_DIR / "scaler.joblib")
-joblib.dump(final_sub_idx, REPO_DIR / "sub_idx.joblib")
-joblib.dump(final_clf, REPO_DIR / "classifier.joblib")
+import shutil
+import zipfile
+
+# ── GUARANTEED WRITABLE STAGING DIRECTORY ──
+KAGGLE_WORKING = Path("/kaggle/working")
+STAGING_DIR = KAGGLE_WORKING / "submission_package"
+if STAGING_DIR.exists():
+    shutil.rmtree(STAGING_DIR)
+STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+# 1. Copy the baseline code to staging
+# We find the baseline dir either in /kaggle/working or in /kaggle/input
+baseline_candidates = [
+    KAGGLE_WORKING / "MoCha-26" / "MoCha_baseline_bundle",
+    *list(Path("/kaggle/input").glob("**/MoCha_baseline_bundle"))
+]
+true_baseline_dir = next((p for p in baseline_candidates if p.exists()), None)
+if true_baseline_dir is None:
+    raise FileNotFoundError("Could not find MoCha_baseline_bundle in working or input dirs!")
+
+# Copy everything from baseline to staging (excluding git and cache)
+def ignore_patterns(path, names):
+    return [n for n in names if n == '.git' or n == '__pycache__' or n.endswith('.pyc')]
+shutil.copytree(true_baseline_dir, STAGING_DIR, dirs_exist_ok=True, ignore=ignore_patterns)
+
+# 2. Save the trained weights directly into the staging weights folder
+weights_dir = STAGING_DIR / "weights"
+weights_dir.mkdir(parents=True, exist_ok=True)
+
+np.save(weights_dir / "valid_features.npy", final_valid_features_idx)
+joblib.dump(final_scaler, weights_dir / "scaler.joblib")
+joblib.dump(final_sub_idx, weights_dir / "sub_idx.joblib")
+joblib.dump(final_clf, weights_dir / "classifier.joblib")
 print(f"Saved final winning model ({name}) to classifier.joblib! Total selected features = {len(final_valid_features_idx)}")
 
-print("--- 4. Packaging Submission ---")
-for fname in ["valid_features.npy", "scaler.joblib", "sub_idx.joblib", "classifier.joblib"]:
-    shutil.copy2(REPO_DIR / fname, BASELINE_DIR / "weights" / fname)
-
-momask_dest = BASELINE_DIR / "weights" / "momask"
+# 3. Copy momask pretrained weights
+momask_dest = weights_dir / "momask"
 momask_dest.mkdir(parents=True, exist_ok=True)
-momask_src = CAREPD_DIR / "assets" / "Pretrained_checkpoints" / "momask"
-shutil.copy2(momask_src / "opt.txt", momask_dest / "opt.txt")
-shutil.copy2(momask_src / "net_best_fid.tar", momask_dest / "net_best_fid.tar")
+momask_candidates = [
+    KAGGLE_WORKING / "MoCha-26" / "CARE-PD_github" / "assets" / "Pretrained_checkpoints" / "momask",
+    *list(Path("/kaggle/input").glob("**/Pretrained_checkpoints/momask"))
+]
+true_momask_dir = next((p for p in momask_candidates if p.exists()), None)
+if true_momask_dir:
+    shutil.copy2(true_momask_dir / "opt.txt", momask_dest / "opt.txt")
+    shutil.copy2(true_momask_dir / "net_best_fid.tar", momask_dest / "net_best_fid.tar")
 
+print("--- 4. Packaging Submission ---")
 zip_path = KAGGLE_WORKING / "submission.zip"
-exclude_dirs = [".git", "classifier"]
 
 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-    for root, dirs, files in os.walk(BASELINE_DIR):
-        dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith('.')]
+    for root, dirs, files in os.walk(STAGING_DIR):
         for file in files:
-            if file.endswith('.pyc'): continue
             file_path = Path(root) / file
-            arcname = file_path.relative_to(BASELINE_DIR)
+            arcname = file_path.relative_to(STAGING_DIR)
             zipf.write(file_path, arcname)
 
 print(f"Kaggle Pipeline Complete! Download {zip_path} from the Kaggle Output section and submit to CodaBench!")
