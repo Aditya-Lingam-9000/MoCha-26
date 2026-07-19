@@ -198,7 +198,6 @@ sys.path.remove(str(CAREPD_DIR))
 
 # Temporarily insert BASELINE_DIR to initialize preprocess model which pulls from data.preprocessing
 sys.path.insert(0, str(BASELINE_DIR))
-from submission.clinical_gait_features import extract_clinical_gait_features
 
 preprocess = MotionPreprocessor(
     smpl_model_path=BASELINE_DIR / "weights" / "smpl" / "SMPL_NEUTRAL.pkl",
