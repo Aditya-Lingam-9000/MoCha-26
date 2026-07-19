@@ -174,7 +174,7 @@ chk_path = BASELINE_DIR / "weights" / "backbone" / "motion_encoder_finetuned.pth
 opt = baseline_get_opt(opt_path, device)
 opt.checkpoints_dir = str(BASELINE_DIR / "weights" / "backbone")
 baseline_wrapper = EvaluatorModelWrapper(opt)
-state = torch.load(chk_path, map_location=device, weights_only=True)
+state = torch.load(chk_path, map_location=device, weights_only=False)
 baseline_wrapper.motion_encoder.load_state_dict(state)
 baseline_wrapper.motion_encoder.eval()
 baseline_wrapper.movement_encoder.eval()
@@ -188,7 +188,7 @@ momask_model = RVQVAE(args=vq_opt, input_width=263, nb_code=vq_opt.nb_code, code
                output_emb_width=vq_opt.code_dim, down_t=vq_opt.down_t, stride_t=vq_opt.stride_t, 
                width=vq_opt.width, depth=vq_opt.depth, dilation_growth_rate=vq_opt.dilation_growth_rate, 
                activation=vq_opt.vq_act, norm=vq_opt.vq_norm)
-checkpoint = torch.load(chk_path_m, map_location=device)['net']
+checkpoint = torch.load(chk_path_m, map_location=device, weights_only=False)['net']
 load_pretrained_weights(momask_model, checkpoint)
 momask_model.eval()
 momask_model.to(device)

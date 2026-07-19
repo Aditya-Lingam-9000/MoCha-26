@@ -91,7 +91,7 @@ class Model:
         opt = baseline_get_opt(opt_path, self.device)
         opt.checkpoints_dir = str(ROOT / "weights" / "backbone")
         wrapper = EvaluatorModelWrapper(opt)
-        state = torch.load(chk_path, map_location=self.device, weights_only=True)
+        state = torch.load(chk_path, map_location=self.device, weights_only=False)
         wrapper.motion_encoder.load_state_dict(state)
         wrapper.motion_encoder.eval()
         wrapper.movement_encoder.eval()
@@ -110,7 +110,7 @@ class Model:
             dilation_growth_rate=vq_opt.dilation_growth_rate,
             activation=vq_opt.vq_act, norm=vq_opt.vq_norm,
         )
-        checkpoint = torch.load(chk_path, map_location=self.device)['net']
+        checkpoint = torch.load(chk_path, map_location=self.device, weights_only=False)['net']
         load_pretrained_weights(model, checkpoint)
         model.eval()
         model.to(self.device)

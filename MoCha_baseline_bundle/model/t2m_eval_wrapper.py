@@ -8,11 +8,13 @@ import torch
 from model.t2m_eval_modules import MotionEncoderBiGRUCo, MovementConvEncoder
 
 
+import pickle
+
 def _torch_load(path: Path, device: torch.device):
     try:
         return torch.load(path, map_location=device, weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location=device)
+    except (TypeError, pickle.UnpicklingError, Exception):
+        return torch.load(path, map_location=device, weights_only=False)
 
 
 def build_models(opt):
