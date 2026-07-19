@@ -59,12 +59,14 @@ if not REPO_DIR.exists():
 BASELINE_DIR = REPO_DIR / "MoCha_baseline_bundle"
 CAREPD_DIR = REPO_DIR / "CARE-PD_github"
 
-# 2. Download Baseline weights by cloning the original baseline bundle
-TEMP_BASELINE = KAGGLE_WORKING / "temp_baseline"
-if not TEMP_BASELINE.exists():
-    run_cmd(f"git clone https://github.com/TaatiTeam/MoCha_baseline_bundle {TEMP_BASELINE}")
-    run_cmd(f"cd {TEMP_BASELINE} && git lfs pull")
-merge_dirs(TEMP_BASELINE / "weights", BASELINE_DIR / "weights")
+# 2. Load Baseline weights from Kaggle Dataset (Bypassing broken GitHub LFS)
+WEIGHTS_DATASET = Path("/kaggle/input/mocha-baseline-weights")
+if not WEIGHTS_DATASET.exists():
+    raise FileNotFoundError(
+        "You must upload 'mocha_baseline_weights.zip' as a Kaggle dataset "
+        "and name it 'mocha-baseline-weights'. The original GitHub repository exceeded its LFS bandwidth."
+    )
+merge_dirs(WEIGHTS_DATASET, BASELINE_DIR / "weights")
 
 # 3. Download MoMask assets by cloning the original CARE-PD repo
 TEMP_CAREPD = KAGGLE_WORKING / "temp_carepd"
