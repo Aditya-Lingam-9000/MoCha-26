@@ -233,14 +233,11 @@ for pkl_file in pkl_files:
                 momask_out = momask_model(motion_tensor)
                 if isinstance(momask_out, tuple): momask_out = momask_out[0]
                 momask_stats = extract_time_series_stats(momask_out) if momask_out.shape[-1] == 512 else extract_time_series_stats(momask_out.permute(0, 2, 1))
-                
-            clinical_feat = extract_clinical_gait_features(joints, fps=25.0)
-            clinical_feat = np.nan_to_num(clinical_feat, nan=0.0, posinf=0.0, neginf=0.0)
+
             combined = np.concatenate([
                 raw_stats.cpu().numpy(),
                 baseline_emb.cpu().numpy(),
-                momask_stats.cpu().numpy(),
-                clinical_feat
+                momask_stats.cpu().numpy()
             ])
             
             row = {'subject_id': subject_id, 'walk_id': walk_id, 'label': label, 'site': site_name}
@@ -338,12 +335,13 @@ X_sup_filtered = X_sup[:, valid_features_idx]
 X_site_centered = X_sup_filtered  # alias kept so rest of code is unchanged
 
 # Ensemble Soft-Voting Classifier Helper (4 Diverse Classifiers)
-def build_ensemble(weights=[2.0, 1.0, 1.0, 1.0]):
-    m1 = SVC(C=1.5, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
-    m2 = ExtraTreesClassifier(n_estimators=200, class_weight='balanced', max_depth=10, random_state=42)
-    m3 = lgb.LGBMClassifier(max_depth=4, n_estimators=200, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
-    m4 = LogisticRegression(C=0.1, class_weight='balanced', max_iter=2000, solver='lbfgs')
-    return VotingClassifier(estimators=[('svc', m1), ('et', m2), ('lgb', m3), ('lr', m4)], voting='soft', weights=weights)
+def build_ensemble(weights=[2.0, 1.5, 1.5, 1.0]):
+    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+    m1 = SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
+    m2 = lgb.LGBMClassifier(max_depth=5, n_estimators=300, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
+    m3 = HistGradientBoostingClassifier(learning_rate=0.03, max_iter=300, random_state=42)
+    m4 = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=42)
+    return VotingClassifier(estimators=[('svc', m1), ('lgb', m2), ('hgb', m3), ('rf', m4)], voting='soft', weights=weights)
 
 # 3. Model Search under GroupKFold & LOGO-CV
 print("\n--- Running Multi-Metric Feature & Model Search ---")
@@ -351,12 +349,12 @@ unique_sites = np.unique(sites_sup)
 gkf = GroupKFold(n_splits=5)
 
 configs = [
-    ("Quantile + MutualInfo 512 + 4-Model Soft Ensemble", "quantile", "mi", 512, build_ensemble([2.0, 1.0, 1.0, 1.0])),
-    ("Quantile + MutualInfo 384 + 4-Model Soft Ensemble", "quantile", "mi", 384, build_ensemble([2.0, 1.0, 1.0, 1.0])),
-    ("Quantile + MutualInfo 256 + 4-Model Soft Ensemble", "quantile", "mi", 256, build_ensemble([2.0, 1.0, 1.0, 1.0])),
-    ("Quantile + MutualInfo 768 + 4-Model Soft Ensemble", "quantile", "mi", 768, build_ensemble([2.0, 1.0, 1.0, 1.0])),
-    ("Quantile + Clinical + Top 384 MI + 4-Model Soft Ensemble", "quantile", "clinical_mi", 384, build_ensemble([2.0, 1.0, 1.0, 1.0])),
-    ("StandardScaler + MutualInfo 384 + 4-Model Soft Ensemble", "standard", "mi", 384, build_ensemble([2.0, 1.0, 1.0, 1.0])),
+    ("Quantile + MutualInfo 256 + 4-Model Soft Ensemble", "quantile", "mi", 256, build_ensemble()),
+    ("Quantile + MutualInfo 384 + 4-Model Soft Ensemble", "quantile", "mi", 384, build_ensemble()),
+    ("Quantile + MutualInfo 512 + 4-Model Soft Ensemble", "quantile", "mi", 512, build_ensemble()),
+    ("Quantile + MutualInfo 768 + 4-Model Soft Ensemble", "quantile", "mi", 768, build_ensemble()),
+    ("StandardScaler + MutualInfo 384 + 4-Model Soft Ensemble", "standard", "mi", 384, build_ensemble()),
+    ("StandardScaler + MutualInfo 512 + 4-Model Soft Ensemble", "standard", "mi", 512, build_ensemble()),
 ]
 
 best_score = -1.0

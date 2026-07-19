@@ -10,7 +10,6 @@ import joblib
 from model.momask.model import RVQVAE
 import model.momask.get_opt as momask_get_opt
 from submission.preprocess import MotionPreprocessor
-from submission.clinical_gait_features import extract_clinical_gait_features
 from model.t2m_eval_wrapper import EvaluatorModelWrapper
 from utils.get_opt import get_opt as baseline_get_opt
 
@@ -133,12 +132,7 @@ class Model:
             else:
                 mo_stats = extract_time_series_stats(mo_out.permute(0, 2, 1))
 
-            clinical_feat = extract_clinical_gait_features(joints, fps=25.0)
-            clinical_feat = np.nan_to_num(clinical_feat, nan=0.0, posinf=0.0, neginf=0.0)
-            clinical_tensor = torch.from_numpy(clinical_feat).float().to(self.device)
-            clinical_tensor = torch.nan_to_num(clinical_tensor, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return torch.cat([raw_stats, base_emb, mo_stats, clinical_tensor])
+        return torch.cat([raw_stats, base_emb, mo_stats])
 
     def _classify(self, features: torch.Tensor) -> torch.Tensor:
         """features: (N, D_raw) -> predictions: (N,) int tensor."""
