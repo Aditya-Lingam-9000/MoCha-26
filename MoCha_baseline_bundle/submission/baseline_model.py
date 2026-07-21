@@ -66,24 +66,17 @@ class Model:
         # Feature selection & scaler
         self.valid_features = np.load(ROOT / "weights" / "valid_features.npy")
         
-        # Load fitted scaler, sub_idx, and classifier
-        scaler_path = ROOT / "weights" / "scaler.joblib"
-        sub_idx_path = ROOT / "weights" / "sub_idx.joblib"
-        clf_path = ROOT / "weights" / "classifier.joblib"
-
-        if scaler_path.exists() and clf_path.exists():
-            self.scaler = joblib.load(scaler_path)
-            self.sub_idx = joblib.load(sub_idx_path) if sub_idx_path.exists() else None
-            self.clf = joblib.load(clf_path)
-            self.use_joblib = True
-        else:
-            self.use_joblib = False
-            self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "scaler_mean.npy")).float().to(self.device)
-            self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "scaler_std.npy")).float().to(self.device)
-            self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
-            self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
-            self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
-            self.thresholds = np.load(ROOT / "weights" / "thresholds.npy")
+        # Load pure NumPy weights (Method 2)
+        self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "scaler_mean.npy")).float().to(self.device)
+        self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "scaler_std.npy")).float().to(self.device)
+        self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
+        self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
+        self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
+        
+        # Load thresholds only if regression model type
+        threshold_path = ROOT / "weights" / "thresholds.npy"
+        if threshold_path.exists():
+            self.thresholds = np.load(threshold_path)
 
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
@@ -133,26 +126,19 @@ class Model:
                 mo_stats = extract_time_series_stats(mo_out.permute(0, 2, 1))
 
         return torch.cat([raw_stats, base_emb, mo_stats])
-
     def _classify(self, features: torch.Tensor) -> torch.Tensor:
         """features: (N, D_raw) -> predictions: (N,) int tensor."""
-        feat_np = features.cpu().numpy()
-        
-        if getattr(self, 'use_joblib', False):
-            expected_raw = int(np.max(self.valid_features)) + 1
-            actual_raw = feat_np.shape[1]
-            if actual_raw < expected_raw:
-                raise ValueError(
-                    f"Feature dimension mismatch: inference has {actual_raw} features "
-                    f"but valid_features expects at least {expected_raw}. "
-                    f"Check that _extract_features() matches training pipeline."
-                )
-            filtered = feat_np[:, self.valid_features]
-            scaled = self.scaler.transform(filtered)
-            preds = self.clf.predict(scaled)
-            return torch.from_numpy(np.array(preds, dtype=np.int64)).to(self.device)
-
         valid_torch = torch.from_numpy(self.valid_features).long().to(self.device)
+        
+        expected_raw = int(torch.max(valid_torch).item()) + 1
+        actual_raw = features.shape[1]
+        if actual_raw < expected_raw:
+            raise ValueError(
+                f"Feature dimension mismatch: inference has {actual_raw} features "
+                f"but valid_features expects at least {expected_raw}. "
+                f"Check that _extract_features() matches training pipeline."
+            )
+            
         filtered = features[:, valid_torch]
         scaled = (filtered - self.scaler_mean) / self.scaler_std
 

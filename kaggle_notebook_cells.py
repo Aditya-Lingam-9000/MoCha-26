@@ -280,20 +280,24 @@ if not REPO_DIR.exists():
             if not dst.exists():
                 shutil.copy2(src_p, dst)
 
-# Load features_fused.csv — try writable dir first, then read-only input
+# --- FORCE RE-EXTRACTION ---
+# The previous features_fused.csv contains deleted clinical features. We must extract fresh.
+FORCE_REEXTRACT = True
+
+# Load features_fused.csv ? try writable dir first, then read-only input
 import os
 csv_candidates = [
     REPO_DIR / "features_fused.csv",
     *list(Path("/kaggle/input").glob("**/features_fused.csv")),
 ]
 csv_path = next((p for p in csv_candidates if p.exists()), None)
-if csv_path is None:
-    raise FileNotFoundError(
-        "features_fused.csv not found! Please run Section 2 first to extract features."
-    )
-print(f"Loading features from: {csv_path}")
-df = pd.read_csv(csv_path, low_memory=False)
-print(f"Loaded features: {df.shape}")
+
+if FORCE_REEXTRACT or csv_path is None:
+    print("Forcing feature re-extraction (or no cached features found). Proceed to Section 2.")
+else:
+    print(f"Loading features from: {csv_path}")
+    df = pd.read_csv(csv_path, low_memory=False)
+    print(f"Loaded features: {df.shape}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -335,14 +339,15 @@ X_sup_filtered = X_sup[:, valid_features_idx]
 # We use X_sup_filtered directly for a consistent train/inference pipeline.
 X_site_centered = X_sup_filtered  # alias kept so rest of code is unchanged
 
-# Ensemble Soft-Voting Classifier Helper (4 Diverse Classifiers)
-def build_ensemble(weights=[2.0, 1.5, 1.5, 1.0]):
-    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-    m1 = SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced', random_state=42)
-    m2 = lgb.LGBMClassifier(max_depth=5, n_estimators=300, learning_rate=0.03, class_weight='balanced', random_state=42, verbosity=-1)
-    m3 = HistGradientBoostingClassifier(learning_rate=0.03, max_iter=300, random_state=42)
-    m4 = RandomForestClassifier(n_estimators=300, class_weight='balanced', random_state=42)
-    return VotingClassifier(estimators=[('svc', m1), ('lgb', m2), ('hgb', m3), ('rf', m4)], voting='soft', weights=weights)
+# Linear Meta-Classifier (Method 2: Numpy-compatible)
+def build_ensemble():
+    return LogisticRegression(
+        multi_class='multinomial', 
+        solver='lbfgs', 
+        max_iter=3000, 
+        class_weight='balanced', 
+        random_state=42
+    )
 
 # 3. Model Search under GroupKFold & LOGO-CV
 print("\n--- Running Multi-Metric Feature & Model Search ---")
@@ -542,10 +547,15 @@ weights_dir = STAGING_DIR / "weights"
 weights_dir.mkdir(parents=True, exist_ok=True)
 
 np.save(weights_dir / "valid_features.npy", final_valid_features_idx)
-joblib.dump(final_scaler, weights_dir / "scaler.joblib")
-joblib.dump(final_sub_idx, weights_dir / "sub_idx.joblib")
-joblib.dump(final_clf, weights_dir / "classifier.joblib")
-print(f"Saved final winning model ({name}) to classifier.joblib! Total selected features = {len(final_valid_features_idx)}")
+
+# Method 2: Save pure numpy arrays instead of fragile joblib objects
+np.save(weights_dir / "scaler_mean.npy", final_scaler.mean_)
+np.save(weights_dir / "scaler_std.npy", final_scaler.scale_)
+np.save(weights_dir / "fusion_coef.npy", final_clf.coef_)
+np.save(weights_dir / "fusion_intercept.npy", final_clf.intercept_)
+np.save(weights_dir / "model_type.npy", np.array([2])) # 2 = Multinomial Logistic Regression
+
+print(f"Saved final winning model ({name}) as pure NumPy arrays! Total selected features = {len(final_valid_features_idx)}")
 
 # 3. Copy momask pretrained weights
 momask_dest = weights_dir / "momask"
