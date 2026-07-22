@@ -60,7 +60,7 @@ BASELINE_DIR = REPO_DIR / "MoCha_baseline_bundle"
 CAREPD_DIR = REPO_DIR / "CARE-PD_github"
 
 # 2. Load Baseline weights from Kaggle Dataset (Bypassing broken GitHub LFS)
-WEIGHTS_DATASET = Path("/kaggle/input/mocha-baseline-weights")
+WEIGHTS_DATASET = Path("/kaggle/input/datasets/jyothiradithyalingam/mocha-baseline-weights")
 if not WEIGHTS_DATASET.exists():
     raise FileNotFoundError(
         "You must upload 'mocha_baseline_weights.zip' as a Kaggle dataset "
@@ -336,187 +336,112 @@ X_sup_filtered = X_sup[:, valid_features_idx]
 # NOTE: Site-wise mean centering is intentionally REMOVED.
 # It cannot be replicated at CodaBench inference time (test site labels are unknown).
 # Fitting the scaler on site-centered data caused 0.00 CodaBench scores.
-# We use X_sup_filtered directly for a consistent train/inference pipeline.
-X_site_centered = X_sup_filtered  # alias kept so rest of code is unchanged
+## ==============================================================================
+# 3. PyTorch Deep Learning 5-Fold MLP Ensemble with Minority Oversampling
+# ==============================================================================
+class MLPClassifier(nn.Module):
+    def __init__(self, input_dim, hidden_dim=512, output_dim=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim // 4, output_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
 
-# Linear Meta-Classifier (Method 2: Numpy-compatible)
-def build_ensemble():
-    return LogisticRegression(
-        multi_class='multinomial', 
-        solver='lbfgs', 
-        max_iter=3000, 
-        class_weight='balanced', 
-        random_state=42
-    )
+def oversample_data(X, y):
+    unique, counts = np.unique(y, return_counts=True)
+    max_count = np.max(counts)
+    X_resampled, y_resampled = [], []
+    for label in unique:
+        idx = np.where(y == label)[0]
+        sampled_idx = np.random.choice(idx, size=max_count, replace=True)
+        X_resampled.append(X[sampled_idx])
+        y_resampled.append(y[sampled_idx])
+    X_res = np.concatenate(X_resampled, axis=0)
+    y_res = np.concatenate(y_resampled, axis=0)
+    shuf_idx = np.random.permutation(len(y_res))
+    return X_res[shuf_idx], y_res[shuf_idx]
 
-# 3. Model Search under GroupKFold & LOGO-CV
-print("\n--- Running Multi-Metric Feature & Model Search ---")
-unique_sites = np.unique(sites_sup)
 gkf = GroupKFold(n_splits=5)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
 
-configs = [
-    ("Quantile + MutualInfo 256 + 4-Model Soft Ensemble", "quantile", "mi", 256, build_ensemble()),
-    ("Quantile + MutualInfo 384 + 4-Model Soft Ensemble", "quantile", "mi", 384, build_ensemble()),
-    ("Quantile + MutualInfo 512 + 4-Model Soft Ensemble", "quantile", "mi", 512, build_ensemble()),
-    ("Quantile + MutualInfo 768 + 4-Model Soft Ensemble", "quantile", "mi", 768, build_ensemble()),
-    ("StandardScaler + MutualInfo 384 + 4-Model Soft Ensemble", "standard", "mi", 384, build_ensemble()),
-    ("StandardScaler + MutualInfo 512 + 4-Model Soft Ensemble", "standard", "mi", 512, build_ensemble()),
-]
+# We will save the scaler parameters and best weights for each fold
+fold_scalers = []
+fold_models = []
 
-best_score = -1.0
-best_config = None
+from torch.utils.data import TensorDataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
 
-for name, stype, feat_mode, k_feat, model_template in configs:
-    logo_scores = []
-    gkf_scores = []
+for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_sup_filtered, y_sup, groups=subjects_sup)):
+    print(f"\n--- Training Fold {fold+1}/5 ---")
+    X_tr_raw, y_tr_raw = X_sup_filtered[tr_idx], y_sup[tr_idx]
+    X_va_raw, y_va_raw = X_sup_filtered[va_idx], y_sup[va_idx]
     
-    # 1. LOGO-CV Evaluation
-    for val_site in unique_sites:
-        tr = sites_sup != val_site
-        va = sites_sup == val_site
-        
-        X_tr_raw = X_site_centered[tr]
-        X_va_raw = X_site_centered[va]
-        y_tr, y_va = y_sup[tr], y_sup[va]
-        
-        if stype == "quantile":
-            scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(y_tr), 1000))
-        else:
-            scaler = StandardScaler()
-            
-        X_tr_scaled = scaler.fit_transform(X_tr_raw)
-        X_va_scaled = scaler.transform(X_va_raw)
-        
-        if feat_mode == "anova":
-            selector = SelectKBest(f_classif, k=k_feat)
-            selector.fit(X_tr_scaled, y_tr)
-            sub_idx = selector.get_support(indices=True)
-        elif feat_mode == "mi":
-            selector = SelectKBest(mutual_info_classif, k=k_feat)
-            selector.fit(X_tr_scaled, y_tr)
-            sub_idx = selector.get_support(indices=True)
-        elif feat_mode == "et":
-            et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
-            et_sel.fit(X_tr_scaled, y_tr)
-            importances = et_sel.feature_importances_
-            sub_idx = np.argsort(importances)[-k_feat:]
-        elif feat_mode == "clinical_mi":
-            non_clinical = [i for i in range(X_tr_scaled.shape[1]) if i not in clinical_indices_filtered]
-            selector = SelectKBest(mutual_info_classif, k=k_feat)
-            selector.fit(X_tr_scaled[:, non_clinical], y_tr)
-            selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
-            sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
-        else:
-            sub_idx = list(range(X_tr_scaled.shape[1]))
-            
-        X_tr = X_tr_scaled[:, sub_idx]
-        X_va = X_va_scaled[:, sub_idx]
-        
-        import copy
-        clf = copy.deepcopy(model_template)
-        clf.fit(X_tr, y_tr)
-        preds = clf.predict(X_va)
-        s = f1_score(y_va, preds, average='macro', zero_division=0)
-        logo_scores.append(s)
-        
-    # 2. GroupKFold (by Subject) Evaluation
-    for tr, va in gkf.split(X_site_centered, y_sup, groups=subjects_sup):
-        X_tr_raw, X_va_raw = X_site_centered[tr], X_site_centered[va]
-        y_tr, y_va = y_sup[tr], y_sup[va]
-        
-        if stype == "quantile":
-            scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(y_tr), 1000))
-        else:
-            scaler = StandardScaler()
-            
-        X_tr_scaled = scaler.fit_transform(X_tr_raw)
-        X_va_scaled = scaler.transform(X_va_raw)
-        
-        if feat_mode == "anova":
-            selector = SelectKBest(f_classif, k=k_feat)
-            selector.fit(X_tr_scaled, y_tr)
-            sub_idx = selector.get_support(indices=True)
-        elif feat_mode == "mi":
-            selector = SelectKBest(mutual_info_classif, k=k_feat)
-            selector.fit(X_tr_scaled, y_tr)
-            sub_idx = selector.get_support(indices=True)
-        elif feat_mode == "et":
-            et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
-            et_sel.fit(X_tr_scaled, y_tr)
-            importances = et_sel.feature_importances_
-            sub_idx = np.argsort(importances)[-k_feat:]
-        elif feat_mode == "clinical_mi":
-            non_clinical = [i for i in range(X_tr_scaled.shape[1]) if i not in clinical_indices_filtered]
-            selector = SelectKBest(mutual_info_classif, k=k_feat)
-            selector.fit(X_tr_scaled[:, non_clinical], y_tr)
-            selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
-            sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
-        else:
-            sub_idx = list(range(X_tr_scaled.shape[1]))
-            
-        X_tr = X_tr_scaled[:, sub_idx]
-        X_va = X_va_scaled[:, sub_idx]
-        
-        clf = copy.deepcopy(model_template)
-        clf.fit(X_tr, y_tr)
-        preds = clf.predict(X_va)
-        s = f1_score(y_va, preds, average='macro', zero_division=0)
-        gkf_scores.append(s)
-        
-    mean_logo = np.mean(logo_scores)
-    mean_gkf = np.mean(gkf_scores)
-    print(f"Config: {name:58s} | LOGO F1 = {mean_logo:.4f} | Subject GroupKFold F1 = {mean_gkf:.4f}")
+    # 1. StandardScaler (fitted on train split, applied to val split)
+    scaler = StandardScaler()
+    X_tr_scaled = scaler.fit_transform(X_tr_raw)
+    X_va_scaled = scaler.transform(X_va_raw)
     
-    # Select based on Subject GroupKFold F1 since CodaBench evaluates all subjects together
-    if mean_gkf > best_score:
-        best_score = mean_gkf
-        best_config = (name, stype, feat_mode, k_feat, model_template)
+    # 2. Oversample training data to balance classes
+    X_tr_bal, y_tr_bal = oversample_data(X_tr_scaled, y_tr_raw)
+    
+    # Convert to PyTorch tensors
+    X_tr_t = torch.tensor(X_tr_bal, dtype=torch.float32)
+    y_tr_t = torch.tensor(y_tr_bal, dtype=torch.long)
+    X_va_t = torch.tensor(X_va_scaled, dtype=torch.float32).to(device)
+    y_va_t = torch.tensor(y_va_raw, dtype=torch.long).to(device)
+    
+    train_dataset = TensorDataset(X_tr_t, y_tr_t)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    
+    # 3. Model setup
+    input_dim = X_tr_bal.shape[1]
+    model = MLPClassifier(input_dim=input_dim).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=80)
+    
+    best_val_f1 = -1.0
+    best_weights = None
+    
+    for epoch in range(80):
+        model.train()
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+        
+        # Eval Macro F1 on validation split
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_va_t)
+            val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
+            val_f1 = f1_score(y_va_raw, val_preds, average='macro', zero_division=0)
+            
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_weights = {k: v.cpu().clone().numpy() for k, v in model.state_dict().items()}
+            
+    print(f"Fold {fold+1} Best Val F1 = {best_val_f1:.4f}")
+    fold_scalers.append((scaler.mean_, scaler.scale_))
+    fold_models.append(best_weights)
 
-print(f"\nWinning Config: {best_config[0]} with Subject GroupKFold F1 = {best_score:.4f}")
-
-# 4. Train final model on ALL supervised data using winning config
-name, stype, feat_mode, k_feat, model_template = best_config
-
-if feat_mode == "anova":
-    selector = SelectKBest(f_classif, k=k_feat)
-    selector.fit(X_site_centered, y_sup)
-    final_sub_idx = selector.get_support(indices=True)
-elif feat_mode == "mi":
-    selector = SelectKBest(mutual_info_classif, k=k_feat)
-    selector.fit(X_site_centered, y_sup)
-    final_sub_idx = selector.get_support(indices=True)
-elif feat_mode == "et":
-    et_sel = ExtraTreesClassifier(n_estimators=100, random_state=42)
-    et_sel.fit(X_site_centered, y_sup)
-    importances = et_sel.feature_importances_
-    final_sub_idx = np.argsort(importances)[-k_feat:]
-elif feat_mode == "clinical_mi":
-    non_clinical = [i for i in range(X_site_centered.shape[1]) if i not in clinical_indices_filtered]
-    selector = SelectKBest(mutual_info_classif, k=k_feat)
-    selector.fit(X_site_centered[:, non_clinical], y_sup)
-    selected_non_clinical = [non_clinical[i] for i in selector.get_support(indices=True)]
-    final_sub_idx = list(set(clinical_indices_filtered + selected_non_clinical))
-else:
-    final_sub_idx = list(range(X_site_centered.shape[1]))
-
-final_valid_features_idx = valid_features_idx[final_sub_idx]
-X_selected_unscaled = X_site_centered[:, final_sub_idx]
-
-if stype == "quantile":
-    final_scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(y_sup), 1000))
-else:
-    final_scaler = StandardScaler()
-
-X_final_input = final_scaler.fit_transform(X_selected_unscaled)
-
-final_clf = copy.deepcopy(model_template)
-final_clf.fit(X_final_input, y_sup)
-train_preds = final_clf.predict(X_final_input)
-
-train_f1 = f1_score(y_sup, train_preds, average='macro', zero_division=0)
-print(f"Final Train Macro F1 = {train_f1:.4f}")
-
-# Save exact winning model, scaler, and selected indices using joblib
+# Save exact model weights and scalers into the staging weights folder
 import shutil
 import zipfile
 
@@ -528,7 +453,6 @@ if STAGING_DIR.exists():
 STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
 # 1. Copy the baseline code to staging
-# We find the baseline dir either in /kaggle/working or in /kaggle/input
 baseline_candidates = [
     KAGGLE_WORKING / "MoCha-26" / "MoCha_baseline_bundle",
     *list(Path("/kaggle/input").glob("**/MoCha_baseline_bundle"))
@@ -537,7 +461,6 @@ true_baseline_dir = next((p for p in baseline_candidates if p.exists()), None)
 if true_baseline_dir is None:
     raise FileNotFoundError("Could not find MoCha_baseline_bundle in working or input dirs!")
 
-# Copy everything from baseline to staging (excluding git and cache)
 def ignore_patterns(path, names):
     return [n for n in names if n == '.git' or n == '__pycache__' or n.endswith('.pyc')]
 shutil.copytree(true_baseline_dir, STAGING_DIR, dirs_exist_ok=True, ignore=ignore_patterns)
@@ -546,16 +469,29 @@ shutil.copytree(true_baseline_dir, STAGING_DIR, dirs_exist_ok=True, ignore=ignor
 weights_dir = STAGING_DIR / "weights"
 weights_dir.mkdir(parents=True, exist_ok=True)
 
-np.save(weights_dir / "valid_features.npy", final_valid_features_idx)
+# Save variance filtered features index
+np.save(weights_dir / "valid_features.npy", valid_features_idx)
 
-# Method 2: Save pure numpy arrays instead of fragile joblib objects
-np.save(weights_dir / "scaler_mean.npy", final_scaler.mean_)
-np.save(weights_dir / "scaler_std.npy", final_scaler.scale_)
-np.save(weights_dir / "fusion_coef.npy", final_clf.coef_)
-np.save(weights_dir / "fusion_intercept.npy", final_clf.intercept_)
-np.save(weights_dir / "model_type.npy", np.array([2])) # 2 = Multinomial Logistic Regression
+# Save all 5 folds' weights & scalers
+for fold in range(5):
+    mean, scale = fold_scalers[fold]
+    best_weights = fold_models[fold]
+    
+    np.save(weights_dir / f"scaler_mean_fold{fold}.npy", mean)
+    np.save(weights_dir / f"scaler_std_fold{fold}.npy", scale)
+    
+    np.save(weights_dir / f"w1_fold{fold}.npy", best_weights['net.0.weight'])
+    np.save(weights_dir / f"b1_fold{fold}.npy", best_weights['net.0.bias'])
+    np.save(weights_dir / f"w2_fold{fold}.npy", best_weights['net.3.weight'])
+    np.save(weights_dir / f"b2_fold{fold}.npy", best_weights['net.3.bias'])
+    np.save(weights_dir / f"w3_fold{fold}.npy", best_weights['net.6.weight'])
+    np.save(weights_dir / f"b3_fold{fold}.npy", best_weights['net.6.bias'])
+    np.save(weights_dir / f"w4_fold{fold}.npy", best_weights['net.9.weight'])
+    np.save(weights_dir / f"b4_fold{fold}.npy", best_weights['net.9.bias'])
 
-print(f"Saved final winning model ({name}) as pure NumPy arrays! Total selected features = {len(final_valid_features_idx)}")
+np.save(weights_dir / "model_type.npy", np.array([3])) # 3 = 5-Fold PyTorch MLP Ensemble
+
+print(f"Saved PyTorch MLP 5-Fold Ensemble weights as pure NumPy arrays! Total features used = {len(valid_features_idx)}")
 
 # 3. Copy momask pretrained weights
 momask_dest = weights_dir / "momask"

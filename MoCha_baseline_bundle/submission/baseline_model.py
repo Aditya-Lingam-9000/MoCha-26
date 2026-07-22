@@ -66,17 +66,52 @@ class Model:
         # Feature selection & scaler
         self.valid_features = np.load(ROOT / "weights" / "valid_features.npy")
         
-        # Load pure NumPy weights (Method 2)
-        self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "scaler_mean.npy")).float().to(self.device)
-        self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "scaler_std.npy")).float().to(self.device)
-        self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
-        self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
         self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
         
-        # Load thresholds only if regression model type
-        threshold_path = ROOT / "weights" / "thresholds.npy"
-        if threshold_path.exists():
-            self.thresholds = np.load(threshold_path)
+        if self.model_type == 3:
+            # Load 5 MLP fold models and 5 scalers
+            self.fold_scalers = []
+            self.fold_w1 = []
+            self.fold_b1 = []
+            self.fold_w2 = []
+            self.fold_b2 = []
+            self.fold_w3 = []
+            self.fold_b3 = []
+            self.fold_w4 = []
+            self.fold_b4 = []
+            
+            for fold in range(5):
+                mean = torch.from_numpy(np.load(ROOT / "weights" / f"scaler_mean_fold{fold}.npy")).float().to(self.device)
+                std = torch.from_numpy(np.load(ROOT / "weights" / f"scaler_std_fold{fold}.npy")).float().to(self.device)
+                self.fold_scalers.append((mean, std))
+                
+                w1 = torch.from_numpy(np.load(ROOT / "weights" / f"w1_fold{fold}.npy")).float().to(self.device)
+                b1 = torch.from_numpy(np.load(ROOT / "weights" / f"b1_fold{fold}.npy")).float().to(self.device)
+                w2 = torch.from_numpy(np.load(ROOT / "weights" / f"w2_fold{fold}.npy")).float().to(self.device)
+                b2 = torch.from_numpy(np.load(ROOT / "weights" / f"b2_fold{fold}.npy")).float().to(self.device)
+                w3 = torch.from_numpy(np.load(ROOT / "weights" / f"w3_fold{fold}.npy")).float().to(self.device)
+                b3 = torch.from_numpy(np.load(ROOT / "weights" / f"b3_fold{fold}.npy")).float().to(self.device)
+                w4 = torch.from_numpy(np.load(ROOT / "weights" / f"w4_fold{fold}.npy")).float().to(self.device)
+                b4 = torch.from_numpy(np.load(ROOT / "weights" / f"b4_fold{fold}.npy")).float().to(self.device)
+                
+                self.fold_w1.append(w1)
+                self.fold_b1.append(b1)
+                self.fold_w2.append(w2)
+                self.fold_b2.append(b2)
+                self.fold_w3.append(w3)
+                self.fold_b3.append(b3)
+                self.fold_w4.append(w4)
+                self.fold_b4.append(b4)
+        else:
+            self.scaler_mean = torch.from_numpy(np.load(ROOT / "weights" / "scaler_mean.npy")).float().to(self.device)
+            self.scaler_std = torch.from_numpy(np.load(ROOT / "weights" / "scaler_std.npy")).float().to(self.device)
+            self.coef = torch.from_numpy(np.load(ROOT / "weights" / "fusion_coef.npy")).float().to(self.device)
+            self.intercept = torch.from_numpy(np.load(ROOT / "weights" / "fusion_intercept.npy")).float().to(self.device)
+            
+            # Load thresholds only if regression model type
+            threshold_path = ROOT / "weights" / "thresholds.npy"
+            if threshold_path.exists():
+                self.thresholds = np.load(threshold_path)
 
     def _load_baseline(self):
         opt_path = ROOT / "weights" / "backbone" / "Comp_v6_KLD005" / "opt.txt"
@@ -140,20 +175,43 @@ class Model:
             )
             
         filtered = features[:, valid_torch]
-        scaled = (filtered - self.scaler_mean) / self.scaler_std
-
-        if self.model_type == 1:
-            pred_cont = torch.matmul(scaled, self.coef.t()) + self.intercept
-            pred_cont_np = pred_cont.squeeze(-1).cpu().numpy()
-            t0, t1, t2 = self.thresholds
-            preds = np.zeros_like(pred_cont_np, dtype=int)
-            preds[pred_cont_np >= t0] = 1
-            preds[pred_cont_np >= t1] = 2
-            preds[pred_cont_np >= t2] = 3
-            return torch.from_numpy(preds).to(self.device)
+        if self.model_type == 3:
+            probs_sum = torch.zeros((features.shape[0], 4), device=self.device)
+            for fold in range(5):
+                mean, std = self.fold_scalers[fold]
+                scaled = (filtered - mean) / std
+                
+                # Layer 1
+                x = torch.matmul(scaled, self.fold_w1[fold].t()) + self.fold_b1[fold]
+                x = torch.relu(x)
+                # Layer 2
+                x = torch.matmul(x, self.fold_w2[fold].t()) + self.fold_b2[fold]
+                x = torch.relu(x)
+                # Layer 3
+                x = torch.matmul(x, self.fold_w3[fold].t()) + self.fold_b3[fold]
+                x = torch.relu(x)
+                # Output Layer
+                logits = torch.matmul(x, self.fold_w4[fold].t()) + self.fold_b4[fold]
+                
+                probs = torch.softmax(logits, dim=1)
+                probs_sum += probs
+                
+            return torch.argmax(probs_sum, dim=1)
+            
         else:
-            logits = torch.matmul(scaled, self.coef.t()) + self.intercept
-            return torch.argmax(logits, dim=1)
+            scaled = (filtered - self.scaler_mean) / self.scaler_std
+            if self.model_type == 1:
+                pred_cont = torch.matmul(scaled, self.coef.t()) + self.intercept
+                pred_cont_np = pred_cont.squeeze(-1).cpu().numpy()
+                t0, t1, t2 = self.thresholds
+                preds = np.zeros_like(pred_cont_np, dtype=int)
+                preds[pred_cont_np >= t0] = 1
+                preds[pred_cont_np >= t1] = 2
+                preds[pred_cont_np >= t2] = 3
+                return torch.from_numpy(preds).to(self.device)
+            else:
+                logits = torch.matmul(scaled, self.coef.t()) + self.intercept
+                return torch.argmax(logits, dim=1)
 
     def predict_dataset(
         self,
