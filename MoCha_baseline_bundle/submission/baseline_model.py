@@ -49,6 +49,50 @@ def extract_time_series_stats(tensor):
     return torch.cat([mean, std, max_v, min_v])
 
 
+import torch.nn as nn
+
+class ResBlock(nn.Module):
+    def __init__(self, dim, dropout=0.3):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.act1 = nn.SiLU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.act2 = nn.SiLU()
+        self.drop2 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        res = x
+        x = self.fc1(self.drop1(self.act1(self.norm1(x))))
+        x = self.fc2(self.drop2(self.act2(self.norm2(x))))
+        return res + x
+
+class ResMLPClassifier(nn.Module):
+    def __init__(self, input_dim, hidden_dim=512, output_dim=4):
+        super().__init__()
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
+        )
+        self.block1 = ResBlock(hidden_dim, dropout=0.35)
+        self.down = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU()
+        )
+        self.block2 = ResBlock(hidden_dim // 2, dropout=0.25)
+        self.head = nn.Linear(hidden_dim // 2, output_dim)
+
+    def forward(self, x):
+        x = self.input_layer(x)
+        x = self.block1(x)
+        x = self.down(x)
+        x = self.block2(x)
+        return self.head(x)
+
 class Model:
     def __init__(self):
         self.device = choose_device()
@@ -68,7 +112,41 @@ class Model:
         
         self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
         
-        if self.model_type == 3:
+        if self.model_type == 4:
+            # Heterogeneous Tri-Model Ensemble (ResMLP + Logistic + Ridge)
+            self.fold_scalers = []
+            self.resmlp_models = []
+            self.logreg_coefs = []
+            self.logreg_intercepts = []
+            self.ridge_coefs = []
+            self.ridge_intercepts = []
+
+            input_dim = len(self.valid_features)
+            for fold in range(5):
+                mean = torch.from_numpy(np.load(ROOT / "weights" / f"scaler_mean_fold{fold}.npy")).float().to(self.device)
+                std = torch.from_numpy(np.load(ROOT / "weights" / f"scaler_std_fold{fold}.npy")).float().to(self.device)
+                self.fold_scalers.append((mean, std))
+
+                # 1. ResMLP Model
+                resmlp = ResMLPClassifier(input_dim=input_dim).to(self.device)
+                resmlp_state = torch.load(ROOT / "weights" / f"resmlp_fold{fold}.pt", map_location=self.device, weights_only=False)
+                resmlp.load_state_dict(resmlp_state)
+                resmlp.eval()
+                self.resmlp_models.append(resmlp)
+
+                # 2. Logistic Regression
+                lr_c = torch.from_numpy(np.load(ROOT / "weights" / f"logreg_coef_fold{fold}.npy")).float().to(self.device)
+                lr_i = torch.from_numpy(np.load(ROOT / "weights" / f"logreg_intercept_fold{fold}.npy")).float().to(self.device)
+                self.logreg_coefs.append(lr_c)
+                self.logreg_intercepts.append(lr_i)
+
+                # 3. Ridge Classifier
+                rg_c = torch.from_numpy(np.load(ROOT / "weights" / f"ridge_coef_fold{fold}.npy")).float().to(self.device)
+                rg_i = torch.from_numpy(np.load(ROOT / "weights" / f"ridge_intercept_fold{fold}.npy")).float().to(self.device)
+                self.ridge_coefs.append(rg_c)
+                self.ridge_intercepts.append(rg_i)
+
+        elif self.model_type == 3:
             # Load 5 MLP fold models and 5 scalers
             self.fold_scalers = []
             self.fold_w1 = []
@@ -175,7 +253,32 @@ class Model:
             )
             
         filtered = features[:, valid_torch]
-        if self.model_type == 3:
+        if self.model_type == 4:
+            probs_sum = torch.zeros((features.shape[0], 4), device=self.device)
+            for fold in range(5):
+                mean, std = self.fold_scalers[fold]
+                scaled = (filtered - mean) / std
+
+                # 1. ResMLP probabilities
+                with torch.no_grad():
+                    logits_resmlp = self.resmlp_models[fold](scaled)
+                    probs_resmlp = torch.softmax(logits_resmlp, dim=1)
+
+                # 2. Logistic Regression probabilities
+                logits_logreg = torch.matmul(scaled, self.logreg_coefs[fold].t()) + self.logreg_intercepts[fold]
+                probs_logreg = torch.softmax(logits_logreg, dim=1)
+
+                # 3. Ridge Classifier probabilities
+                logits_ridge = torch.matmul(scaled, self.ridge_coefs[fold].t()) + self.ridge_intercepts[fold]
+                probs_ridge = torch.softmax(logits_ridge, dim=1)
+
+                # Tri-model weighted fusion (0.6 ResMLP, 0.2 Logistic, 0.2 Ridge)
+                fold_probs = 0.6 * probs_resmlp + 0.2 * probs_logreg + 0.2 * probs_ridge
+                probs_sum += fold_probs
+
+            return torch.argmax(probs_sum, dim=1)
+
+        elif self.model_type == 3:
             probs_sum = torch.zeros((features.shape[0], 4), device=self.device)
             for fold in range(5):
                 mean, std = self.fold_scalers[fold]

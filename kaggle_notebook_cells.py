@@ -336,67 +336,110 @@ X_sup_filtered = X_sup[:, valid_features_idx]
 # NOTE: Site-wise mean centering is intentionally REMOVED.
 # It cannot be replicated at CodaBench inference time (test site labels are unknown).
 # Fitting the scaler on site-centered data caused 0.00 CodaBench scores.
-## ==============================================================================
-# 3. PyTorch Deep Learning 5-Fold MLP Ensemble with Minority Oversampling
 # ==============================================================================
-class MLPClassifier(nn.Module):
+# 3. PyTorch ResMLP + Tri-Model Ensemble (ResMLP + Logistic + Ridge)
+# ==============================================================================
+class ResBlock(nn.Module):
+    def __init__(self, dim, dropout=0.3):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.act1 = nn.SiLU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.act2 = nn.SiLU()
+        self.drop2 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        res = x
+        x = self.fc1(self.drop1(self.act1(self.norm1(x))))
+        x = self.fc2(self.drop2(self.act2(self.norm2(x))))
+        return res + x
+
+class ResMLPClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim=512, output_dim=4):
         super().__init__()
-        self.net = nn.Sequential(
+        self.input_layer = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim // 4, output_dim)
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
         )
-    def forward(self, x):
-        return self.net(x)
+        self.block1 = ResBlock(hidden_dim, dropout=0.35)
+        self.down = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU()
+        )
+        self.block2 = ResBlock(hidden_dim // 2, dropout=0.25)
+        self.head = nn.Linear(hidden_dim // 2, output_dim)
 
-def oversample_data(X, y):
+    def forward(self, x):
+        x = self.input_layer(x)
+        x = self.block1(x)
+        x = self.down(x)
+        x = self.block2(x)
+        return self.head(x)
+
+def oversample_data_with_jitter(X, y, noise_std=0.08):
     unique, counts = np.unique(y, return_counts=True)
     max_count = np.max(counts)
     X_resampled, y_resampled = [], []
     for label in unique:
         idx = np.where(y == label)[0]
         sampled_idx = np.random.choice(idx, size=max_count, replace=True)
-        X_resampled.append(X[sampled_idx])
+        X_samples = X[sampled_idx].copy()
+        if len(idx) < max_count:
+            feature_stds = np.std(X, axis=0, keepdims=True)
+            noise = np.random.normal(0.0, noise_std, size=X_samples.shape) * (feature_stds + 1e-6)
+            X_samples += noise
+        X_resampled.append(X_samples)
         y_resampled.append(y[sampled_idx])
     X_res = np.concatenate(X_resampled, axis=0)
     y_res = np.concatenate(y_resampled, axis=0)
     shuf_idx = np.random.permutation(len(y_res))
     return X_res[shuf_idx], y_res[shuf_idx]
 
+def mixup_data(x, y, alpha=0.2):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+from sklearn.linear_model import RidgeClassifier
+
+print("\n--- Training Heterogeneous 15-Model Tri-Ensemble (ResMLP + Logistic + Ridge) ---")
 gkf = GroupKFold(n_splits=5)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-# We will save the scaler parameters and best weights for each fold
 fold_scalers = []
-fold_models = []
-
-from torch.utils.data import TensorDataset, DataLoader
-import torch.nn as nn
-import torch.optim as optim
+fold_resmlps = []
+fold_logregs = []
+fold_ridges = []
 
 for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_sup_filtered, y_sup, groups=subjects_sup)):
     print(f"\n--- Training Fold {fold+1}/5 ---")
     X_tr_raw, y_tr_raw = X_sup_filtered[tr_idx], y_sup[tr_idx]
     X_va_raw, y_va_raw = X_sup_filtered[va_idx], y_sup[va_idx]
     
-    # 1. StandardScaler (fitted on train split, applied to val split)
+    # 1. StandardScaler
     scaler = StandardScaler()
     X_tr_scaled = scaler.fit_transform(X_tr_raw)
     X_va_scaled = scaler.transform(X_va_raw)
     
-    # 2. Oversample training data to balance classes
-    X_tr_bal, y_tr_bal = oversample_data(X_tr_scaled, y_tr_raw)
+    # 2. Oversample with Gaussian Noise Jittering
+    X_tr_bal, y_tr_bal = oversample_data_with_jitter(X_tr_scaled, y_tr_raw, noise_std=0.08)
     
-    # Convert to PyTorch tensors
+    # --- Model A: PyTorch ResMLP Classifier ---
     X_tr_t = torch.tensor(X_tr_bal, dtype=torch.float32)
     y_tr_t = torch.tensor(y_tr_bal, dtype=torch.long)
     X_va_t = torch.tensor(X_va_scaled, dtype=torch.float32).to(device)
@@ -405,41 +448,53 @@ for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_sup_filtered, y_sup, groups=
     train_dataset = TensorDataset(X_tr_t, y_tr_t)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     
-    # 3. Model setup
     input_dim = X_tr_bal.shape[1]
-    model = MLPClassifier(input_dim=input_dim).to(device)
+    resmlp = ResMLPClassifier(input_dim=input_dim).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = optim.AdamW(resmlp.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=80)
     
     best_val_f1 = -1.0
-    best_weights = None
+    best_resmlp_weights = None
     
     for epoch in range(80):
-        model.train()
+        resmlp.train()
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            inputs, targets_a, targets_b, lam = mixup_data(batch_x, batch_y, alpha=0.2)
             optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
+            outputs = resmlp(inputs)
+            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
             loss.backward()
             optimizer.step()
         scheduler.step()
         
-        # Eval Macro F1 on validation split
-        model.eval()
+        resmlp.eval()
         with torch.no_grad():
-            val_outputs = model(X_va_t)
+            val_outputs = resmlp(X_va_t)
             val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
             val_f1 = f1_score(y_va_raw, val_preds, average='macro', zero_division=0)
             
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            best_weights = {k: v.cpu().clone().numpy() for k, v in model.state_dict().items()}
+            best_resmlp_weights = copy.deepcopy(resmlp.state_dict())
             
-    print(f"Fold {fold+1} Best Val F1 = {best_val_f1:.4f}")
+    print(f"Fold {fold+1} ResMLP Best Val F1 = {best_val_f1:.4f}")
+    
+    # --- Model B: Multinomial Logistic Regression ---
+    clf_logreg = LogisticRegression(
+        multi_class='multinomial', solver='lbfgs', max_iter=3000, class_weight='balanced', random_state=42
+    )
+    clf_logreg.fit(X_tr_bal, y_tr_bal)
+    
+    # --- Model C: Ridge Classifier ---
+    clf_ridge = RidgeClassifier(class_weight='balanced', alpha=10.0, random_state=42)
+    clf_ridge.fit(X_tr_bal, y_tr_bal)
+    
     fold_scalers.append((scaler.mean_, scaler.scale_))
-    fold_models.append(best_weights)
+    fold_resmlps.append(best_resmlp_weights)
+    fold_logregs.append((clf_logreg.coef_, clf_logreg.intercept_))
+    fold_ridges.append((clf_ridge.coef_, clf_ridge.intercept_))
 
 # Save exact model weights and scalers into the staging weights folder
 import shutil
@@ -469,29 +524,28 @@ shutil.copytree(true_baseline_dir, STAGING_DIR, dirs_exist_ok=True, ignore=ignor
 weights_dir = STAGING_DIR / "weights"
 weights_dir.mkdir(parents=True, exist_ok=True)
 
-# Save variance filtered features index
 np.save(weights_dir / "valid_features.npy", valid_features_idx)
 
-# Save all 5 folds' weights & scalers
 for fold in range(5):
     mean, scale = fold_scalers[fold]
-    best_weights = fold_models[fold]
+    resmlp_weights = fold_resmlps[fold]
+    lr_c, lr_i = fold_logregs[fold]
+    rg_c, rg_i = fold_ridges[fold]
     
     np.save(weights_dir / f"scaler_mean_fold{fold}.npy", mean)
     np.save(weights_dir / f"scaler_std_fold{fold}.npy", scale)
     
-    np.save(weights_dir / f"w1_fold{fold}.npy", best_weights['net.0.weight'])
-    np.save(weights_dir / f"b1_fold{fold}.npy", best_weights['net.0.bias'])
-    np.save(weights_dir / f"w2_fold{fold}.npy", best_weights['net.3.weight'])
-    np.save(weights_dir / f"b2_fold{fold}.npy", best_weights['net.3.bias'])
-    np.save(weights_dir / f"w3_fold{fold}.npy", best_weights['net.6.weight'])
-    np.save(weights_dir / f"b3_fold{fold}.npy", best_weights['net.6.bias'])
-    np.save(weights_dir / f"w4_fold{fold}.npy", best_weights['net.9.weight'])
-    np.save(weights_dir / f"b4_fold{fold}.npy", best_weights['net.9.bias'])
+    torch.save(resmlp_weights, weights_dir / f"resmlp_fold{fold}.pt")
+    
+    np.save(weights_dir / f"logreg_coef_fold{fold}.npy", lr_c)
+    np.save(weights_dir / f"logreg_intercept_fold{fold}.npy", lr_i)
+    
+    np.save(weights_dir / f"ridge_coef_fold{fold}.npy", rg_c)
+    np.save(weights_dir / f"ridge_intercept_fold{fold}.npy", rg_i)
 
-np.save(weights_dir / "model_type.npy", np.array([3])) # 3 = 5-Fold PyTorch MLP Ensemble
+np.save(weights_dir / "model_type.npy", np.array([4])) # 4 = Heterogeneous 15-Model Tri-Ensemble
 
-print(f"Saved PyTorch MLP 5-Fold Ensemble weights as pure NumPy arrays! Total features used = {len(valid_features_idx)}")
+print(f"Saved Heterogeneous Tri-Model Ensemble weights! Total features used = {len(valid_features_idx)}")
 
 # 3. Copy momask pretrained weights
 momask_dest = weights_dir / "momask"
