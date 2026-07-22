@@ -32,6 +32,13 @@ venv/
 env/
 .env
 
+# Temporary extraction & testing folders
+temp_*
+.vscode/
+*.json
+fix_zip.py
+patch_zip.py
+
 # System Files
 .DS_Store
 Thumbs.db
