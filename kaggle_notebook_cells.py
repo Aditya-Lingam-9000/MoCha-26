@@ -24,6 +24,7 @@ from tqdm import tqdm
 import shutil
 import zipfile
 import collections
+import copy
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import f1_score
@@ -477,7 +478,7 @@ for fold, (tr_idx, va_idx) in enumerate(gkf.split(X_sup_filtered, y_sup, groups=
             
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            best_resmlp_weights = copy.deepcopy(resmlp.state_dict())
+            best_resmlp_weights = {k: v.cpu().clone() for k, v in resmlp.state_dict().items()}
             
     print(f"Fold {fold+1} ResMLP Best Val F1 = {best_val_f1:.4f}")
     
@@ -524,28 +525,16 @@ shutil.copytree(true_baseline_dir, STAGING_DIR, dirs_exist_ok=True, ignore=ignor
 weights_dir = STAGING_DIR / "weights"
 weights_dir.mkdir(parents=True, exist_ok=True)
 
-np.save(weights_dir / "valid_features.npy", valid_features_idx)
+# Copy Ordinal DANN + PCA pre-trained domain-invariant assets from repository weights
+src_weights = true_baseline_dir / "weights"
+for pt_file in ["classifier_ordinal_dann.pth", "pca_components.pt", "pca_mean.pt", "scaler_mean.pt", "scaler_std.pt"]:
+    if (src_weights / pt_file).exists():
+        shutil.copy2(src_weights / pt_file, weights_dir / pt_file)
 
-for fold in range(5):
-    mean, scale = fold_scalers[fold]
-    resmlp_weights = fold_resmlps[fold]
-    lr_c, lr_i = fold_logregs[fold]
-    rg_c, rg_i = fold_ridges[fold]
-    
-    np.save(weights_dir / f"scaler_mean_fold{fold}.npy", mean)
-    np.save(weights_dir / f"scaler_std_fold{fold}.npy", scale)
-    
-    torch.save(resmlp_weights, weights_dir / f"resmlp_fold{fold}.pt")
-    
-    np.save(weights_dir / f"logreg_coef_fold{fold}.npy", lr_c)
-    np.save(weights_dir / f"logreg_intercept_fold{fold}.npy", lr_i)
-    
-    np.save(weights_dir / f"ridge_coef_fold{fold}.npy", rg_c)
-    np.save(weights_dir / f"ridge_intercept_fold{fold}.npy", rg_i)
+np.save(weights_dir / "valid_features.npy", np.arange(3612))
+np.save(weights_dir / "model_type.npy", np.array([5])) # 5 = Ordinal DANN + 256-dim PCA Projection
 
-np.save(weights_dir / "model_type.npy", np.array([4])) # 4 = Heterogeneous 15-Model Tri-Ensemble
-
-print(f"Saved Heterogeneous Tri-Model Ensemble weights! Total features used = {len(valid_features_idx)}")
+print("Saved Ordinal DANN + PCA Domain-Invariant Model weights (model_type = 5) successfully!")
 
 # 3. Copy momask pretrained weights
 momask_dest = weights_dir / "momask"

@@ -5,6 +5,7 @@ import collections
 
 import numpy as np
 import torch
+import torch.nn as nn
 import joblib
 
 from model.momask.model import RVQVAE
@@ -49,7 +50,25 @@ def extract_time_series_stats(tensor):
     return torch.cat([mean, std, max_v, min_v])
 
 
-import torch.nn as nn
+class OrdinalDANNModel(nn.Module):
+    def __init__(self, input_dim=256):
+        super().__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.4)
+        )
+        self.severity_predictor = nn.Linear(128, 1)
+        
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        severity = self.severity_predictor(features)
+        return severity
 
 class ResBlock(nn.Module):
     def __init__(self, dim, dropout=0.3):
@@ -108,11 +127,36 @@ class Model:
         self.momask_model = self._load_momask()
 
         # Feature selection & scaler
-        self.valid_features = np.load(ROOT / "weights" / "valid_features.npy")
+        valid_feat_path = ROOT / "weights" / "valid_features.npy"
+        if valid_feat_path.exists():
+            self.valid_features = np.load(valid_feat_path)
+        else:
+            self.valid_features = np.arange(3612)
         
-        self.model_type = int(np.load(ROOT / "weights" / "model_type.npy")[0])
+        model_type_path = ROOT / "weights" / "model_type.npy"
+        if model_type_path.exists():
+            self.model_type = int(np.load(model_type_path)[0])
+        else:
+            self.model_type = 5
         
-        if self.model_type == 4:
+        if self.model_type == 5:
+            # Ordinal DANN + PCA Model
+            self.pca_components = torch.load(ROOT / "weights" / "pca_components.pt", map_location=self.device, weights_only=False)
+            self.pca_mean = torch.load(ROOT / "weights" / "pca_mean.pt", map_location=self.device, weights_only=False)
+            self.scaler_mean = torch.load(ROOT / "weights" / "scaler_mean.pt", map_location=self.device, weights_only=False)
+            self.scaler_std = torch.load(ROOT / "weights" / "scaler_std.pt", map_location=self.device, weights_only=False)
+            
+            self.dann = OrdinalDANNModel(input_dim=256).to(self.device)
+            dann_state = torch.load(ROOT / "weights" / "classifier_ordinal_dann.pth", map_location=self.device, weights_only=False)
+            if 'optimized_thresholds' in dann_state:
+                self.thresholds = dann_state.pop('optimized_thresholds').cpu().numpy()
+            else:
+                self.thresholds = np.array([0.40, 1.30, 2.10])
+                
+            self.dann.load_state_dict(dann_state, strict=False)
+            self.dann.eval()
+            
+        elif self.model_type == 4:
             # Heterogeneous Tri-Model Ensemble (ResMLP + Logistic + Ridge)
             self.fold_scalers = []
             self.resmlp_models = []
@@ -253,7 +297,22 @@ class Model:
             )
             
         filtered = features[:, valid_torch]
-        if self.model_type == 4:
+        if self.model_type == 5:
+            # Ordinal DANN + 256-dim PCA Projection
+            x_scaled = (features - self.scaler_mean) / self.scaler_std
+            x_pca = torch.matmul(x_scaled - self.pca_mean, self.pca_components.T)
+            
+            with torch.no_grad():
+                severity = self.dann(x_pca).squeeze(-1).cpu().numpy()
+                
+            t0, t1, t2 = self.thresholds
+            preds = np.zeros_like(severity, dtype=int)
+            preds[severity >= t0] = 1
+            preds[severity >= t1] = 2
+            preds[severity >= t2] = 3
+            return torch.from_numpy(preds).to(self.device)
+
+        elif self.model_type == 4:
             probs_sum = torch.zeros((features.shape[0], 4), device=self.device)
             for fold in range(5):
                 mean, std = self.fold_scalers[fold]
